@@ -1,0 +1,43 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+    <meta charset="UTF-8">
+    <title>Analyse Centris</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <style>
+        body { font-family: sans-serif; max-width: 800px; margin: 20px auto; padding: 10px; }
+        input, button { padding: 10px; margin-top: 10px; width: 100%; }
+        button { background: black; color: white; border: none; }
+        .card { border: 1px solid #ccc; padding: 15px; margin-top: 20px; border-radius: 6px; }
+        .label { font-weight: bold; }
+        .error { color: red; margin-top: 10px; }
+    </style>
+</head>
+<body>
+
+    <h1>Analyseur Centris</h1>
+
+    <form method="POST">
+        <input type="text" name="url" placeholder="Collez un lien Centris ici">
+        <button type="submit">Analyser</button>
+    </form>
+
+    {% if error %}
+        <p class="error">{{ error }}</p>
+    {% endif %}
+
+    {% if result %}
+    <div class="card">
+        <div><span class="label">Prix :</span> {{ result["prix"] }}</div>
+        <div><span class="label">NOI :</span> {{ result["noi"] }}</div>
+        <div><span class="label">Cap rate :</span> {{ result["cap_rate"] }}%</</div>
+        <div><span class="label">Cashflow :</span> {{ result["cashflow"] }}</div>
+        <hr>
+        <div><span class="label">Taxes municipales :</span> {{ result["taxes_municipales"] }}</div>
+        <div><span class="label">Taxes scolaires :</span> {{ result["taxes_scolaires"] }}</div>
+        <div><span class="label">Revenu brut potentiel :</span> {{ result["revenu_brut_potentiel"] }}</div>
+    </div>
+    {% endif %}
+
+</body>
+</html>
