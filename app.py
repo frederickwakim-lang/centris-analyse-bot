@@ -1,12 +1,31 @@
 import os
 import json
+import requests
+import smtplib
+from email.mime.text import MIMEText
+from email.mime.multipart import MIMEMultipart
+
 from flask import Flask, request, Response
 from dotenv import load_dotenv
 from openai import OpenAI
 
+from apscheduler.schedulers.background import BackgroundScheduler
+from bs4 import BeautifulSoup
+
 # Charger la clé API OpenAI (.env)
 load_dotenv()
 client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+
+# --- Config Centris + email ---
+CENTRIS_SEARCH_URL = os.getenv("CENTRIS_SEARCH_URL")
+NOTIFY_EMAIL_FROM = os.getenv("NOTIFY_EMAIL_FROM")
+NOTIFY_EMAIL_TO = os.getenv("NOTIFY_EMAIL_TO")
+SMTP_HOST = os.getenv("SMTP_HOST", "smtp.gmail.com")
+SMTP_PORT = int(os.getenv("SMTP_PORT", "587"))
+SMTP_USER = os.getenv("SMTP_USER")
+SMTP_PASS = os.getenv("SMTP_PASS")
+
+PROCESSED_IDS_FILE = "processed_listings.json"
 
 app = Flask(__name__)
 # On ne s'y fie plus pour l'ordre, mais on le laisse False
@@ -66,6 +85,27 @@ Dépenses :
 notes :
 - court texte avec le nom du site source (Remax, PMML, Centris, etc.) et des remarques utiles.
 """
+
+# ========== UTIL: PERSISTANCE DES IDS DÉJÀ TRAITÉS ==========
+
+def load_processed_ids():
+    if not os.path.exists(PROCESSED_IDS_FILE):
+        return set()
+    try:
+        with open(PROCESSED_IDS_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+            return set(data)
+    except Exception:
+        return set()
+
+
+def save_processed_ids(ids_set):
+    try:
+        with open(PROCESSED_IDS_FILE, "w", encoding="utf-8") as f:
+            json.dump(list(ids_set), f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        print("Erreur sauvegarde processed_listings:", e)
+
 
 # 2) FONCTION UTILITAIRE : calculs Python = mêmes idées que ton Excel
 def compute_template(extracted: dict) -> dict:
@@ -254,19 +294,13 @@ def compute_template(extracted: dict) -> dict:
     return result
 
 
-@app.route("/analyze", methods=["POST"])
-def analyze():
-    data = request.get_json()
-    if not data or "content" not in data:
-        return Response(
-            json.dumps({"error": "Champ 'content' manquant"}, ensure_ascii=False, indent=2),
-            mimetype="application/json",
-            status=400,
-        )
+# ========== UTIL: APPEL IA COMPLET SUR UN CONTENU BRUT (HTML OU TEXTE) ==========
 
-    page_content = data["content"]
-
-    # 1) Appel à l'IA pour EXTRACTION SEULEMENT
+def analyze_page_content(page_content: str) -> dict:
+    """
+    Utilise ton prompt d'extraction + compute_template.
+    Réutilisé par /analyze ET par le bot automatique Centris.
+    """
     messages = [
         {"role": "system", "content": EXTRACTION_PROMPT},
         {
@@ -279,30 +313,195 @@ def analyze():
         },
     ]
 
+    resp = client.chat.completions.create(
+        model="gpt-4o-mini",
+        messages=messages,
+        response_format={"type": "json_object"},
+    )
+    extraction_json = resp.choices[0].message.content
+    extracted = json.loads(extraction_json)
+
+    result_dict = compute_template(extracted)
+    return result_dict
+
+
+# ========== UTIL: ENVOI D'EMAIL ==========
+
+def send_email(subject: str, body: str):
+    if not (NOTIFY_EMAIL_FROM and NOTIFY_EMAIL_TO and SMTP_USER and SMTP_PASS):
+        print("Email non configuré correctement dans .env, skip send_email.")
+        return
+
+    msg = MIMEMultipart()
+    msg["From"] = NOTIFY_EMAIL_FROM
+    msg["To"] = NOTIFY_EMAIL_TO
+    msg["Subject"] = subject
+
+    msg.attach(MIMEText(body, "plain", "utf-8"))
+
     try:
-        resp = client.chat.completions.create(
-                model="gpt-4o-mini",
-            messages=messages,
-            response_format={"type": "json_object"},
-        )
-        extraction_json = resp.choices[0].message.content
-        extracted = json.loads(extraction_json)
+        with smtplib.SMTP(SMTP_HOST, SMTP_PORT) as server:
+            server.starttls()
+            server.login(SMTP_USER, SMTP_PASS)
+            server.send_message(msg)
+        print("Email envoyé à", NOTIFY_EMAIL_TO)
     except Exception as e:
-        err = {"error": f"Erreur extraction: {e}"}
+        print("Erreur envoi email:", e)
+
+
+# ========== UTIL: SCRAPER CENTRIS ==========
+
+def get_listing_links_from_search_page():
+    """
+    Va sur la page de recherche Centris et récupère les liens individuels des annonces.
+    """
+    if not CENTRIS_SEARCH_URL:
+        print("CENTRIS_SEARCH_URL non défini, skip scraping.")
+        return []
+
+    try:
+        headers = {
+            "User-Agent": "Mozilla/5.0 (compatible; CentrisBot/1.0)"
+        }
+        r = requests.get(CENTRIS_SEARCH_URL, headers=headers, timeout=20)
+        r.raise_for_status()
+        soup = BeautifulSoup(r.text, "html.parser")
+
+        links = []
+        for a in soup.find_all("a", href=True):
+            href = a["href"]
+            if "NoMLS=" in href or "/fr/propriete" in href:
+                if href.startswith("http"):
+                    url = href
+                else:
+                    url = "https://www.centris.ca" + href
+                if url not in links:
+                    links.append(url)
+
+        return links
+
+    except Exception as e:
+        print("Erreur récupération page de recherche Centris:", e)
+        return []
+
+
+def download_listing_html(url: str) -> str:
+    try:
+        headers = {
+            "User-Agent": "Mozilla/5.0 (compatible; CentrisBot/1.0)"
+        }
+        r = requests.get(url, headers=headers, timeout=20)
+        r.raise_for_status()
+        return r.text
+    except Exception as e:
+        print("Erreur download listing:", url, e)
+        return ""
+
+
+def extract_listing_id_from_url(url: str) -> str:
+    """
+    Essaie d'extraire un ID unique de l'URL (ex: NoMLS=12345678).
+    C'est juste pour déterminer si on l'a déjà traité.
+    """
+    if "NoMLS=" in url:
+        part = url.split("NoMLS=")[-1]
+        part = part.split("&")[0]
+        return part
+    # fallback : l'URL complète comme ID
+    return url
+
+
+# ========== TÂCHE AUTOMATIQUE : NOUVELLES ANNONCES CENTRIS ==========
+
+def process_new_centris_listings():
+    print("=== Tâche automatique: scan Centris ===")
+    processed_ids = load_processed_ids()
+
+    links = get_listing_links_from_search_page()
+    print(f"Liens trouvés sur la page de recherche: {len(links)}")
+
+    new_count = 0
+
+    for url in links:
+        listing_id = extract_listing_id_from_url(url)
+
+        # Si déjà traité, on saute
+        if listing_id in processed_ids:
+            continue
+
+        print(f"Nouvelle annonce détectée: {url}")
+
+        html = download_listing_html(url)
+        if not html:
+            print("HTML vide, skip.")
+            continue
+
+        try:
+            data = analyze_page_content(html)
+        except Exception as e:
+            print("Erreur analyse OpenAI sur", url, "->", e)
+            continue
+
+        # Construire un corps d'email lisible
+        body = "Nouvelle annonce Centris détectée:\n\n"
+        body += f"URL: {url}\n\n"
+        body += "Données analysées:\n"
+        body += json.dumps(data, ensure_ascii=False, indent=2)
+
+        send_email(subject="Nouvelle annonce Centris analysée", body=body)
+
+        # Marquer comme traité
+        processed_ids.add(listing_id)
+        new_count += 1
+
+    save_processed_ids(processed_ids)
+    print(f"Scan terminé. Nouvelles annonces traitées: {new_count}")
+
+
+# ========== FLASK ROUTES EXISTANTES + ROUTE DE TEST ==========
+
+@app.route("/analyze", methods=["POST"])
+def analyze():
+    data = request.get_json()
+    if not data or "content" not in data:
         return Response(
-            json.dumps(err, ensure_ascii=False, indent=2),
+            json.dumps({"error": "Champ 'content' manquant"}, ensure_ascii=False, indent=2),
             mimetype="application/json",
-            status=500,
+            status=400,
         )
 
-    # 2) Calculs Python (comme ton Excel)
+    raw_content = (data["content"] or "").strip()
+
+    # 1) Si c’est une URL, on va chercher la page (ex: lien Centris)
+    if raw_content.startswith("http://") or raw_content.startswith("https://"):
+        url = raw_content
+        try:
+            resp_page = requests.get(
+                url,
+                headers={
+                    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"
+                },
+                timeout=15,
+            )
+            resp_page.raise_for_status()
+            page_content = resp_page.text
+        except Exception as e:
+            err = {"error": f"Erreur en récupérant l'URL: {url} -> {e}"}
+            return Response(
+                json.dumps(err, ensure_ascii=False, indent=2),
+                mimetype="application/json",
+                status=500,
+            )
+    else:
+        # 2) Sinon, on considère que tu as collé le HTML/texte brut
+        page_content = raw_content
+
     try:
-        result_dict = compute_template(extracted)
-        # ICI on contrôle nous-mêmes la sérialisation : pas de tri, ordre respecté
+        result_dict = analyze_page_content(page_content)
         json_text = json.dumps(result_dict, ensure_ascii=False, indent=2)
         return Response(json_text, mimetype="application/json")
     except Exception as e:
-        err = {"error": f"Erreur calculs: {e}"}
+        err = {"error": f"Erreur calculs/analyse: {e}"}
         return Response(
             json.dumps(err, ensure_ascii=False, indent=2),
             mimetype="application/json",
@@ -322,7 +521,7 @@ def index():
       <body>
         <h1>Analyse d'annonce immobilière</h1>
 
-        <p>Colle ici le contenu de la fiche (texte ou HTML) :</p>
+        <p>Colle ici le contenu de la fiche (texte ou HTML) <b>ou simplement le lien Centris</b> :</p>
         <textarea id="content" style="width:100%;height:300px;"></textarea>
 
         <br><br>
@@ -354,5 +553,25 @@ def index():
     </html>
     """
 
+
+@app.route("/scan-une-fois", methods=["GET"])
+def scan_une_fois():
+    """
+    Route pratique pour déclencher un scan manuel (test).
+    """
+    process_new_centris_listings()
+    return "Scan Centris effectué."
+
+
+# ========== SCHEDULER DE FOND ==========
+
+scheduler = BackgroundScheduler()
+scheduler.add_job(process_new_centris_listings, "interval", minutes=15)
+scheduler.start()
+
+
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=5000, debug=True)
+    # Port dynamique pour Render (PORT) + 5000 en local
+    port = int(os.environ.get("PORT", 5000))
+    # debug=False pour éviter que le reloader lance le scheduler deux fois
+    app.run(host="0.0.0.0", port=port, debug=False)

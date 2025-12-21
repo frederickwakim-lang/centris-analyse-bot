@@ -2,3 +2,7 @@ flask
 python-dotenv
 openai
 requests
+beautifulsoup4
+apscheduler
+bs4
+
