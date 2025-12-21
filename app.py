@@ -281,7 +281,7 @@ def analyze():
 
     try:
         resp = client.chat.completions.create(
-            model="gpt-4.1-mini",
+                model="gpt-4o-mini",
             messages=messages,
             response_format={"type": "json_object"},
         )
