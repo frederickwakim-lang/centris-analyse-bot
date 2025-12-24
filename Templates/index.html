@@ -2,42 +2,148 @@
 <html lang="fr">
 <head>
     <meta charset="UTF-8">
-    <title>Analyse Centris</title>
-    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Analyseur Centris</title>
     <style>
-        body { font-family: sans-serif; max-width: 800px; margin: 20px auto; padding: 10px; }
-        input, button { padding: 10px; margin-top: 10px; width: 100%; }
-        button { background: black; color: white; border: none; }
-        .card { border: 1px solid #ccc; padding: 15px; margin-top: 20px; border-radius: 6px; }
-        .label { font-weight: bold; }
-        .error { color: red; margin-top: 10px; }
+        body {
+            font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+            background: #f5f5f5;
+            margin: 0;
+            padding: 2rem;
+        }
+        h1 {
+            text-align: center;
+            margin-bottom: 1rem;
+        }
+        .container {
+            max-width: 1100px;
+            margin: 0 auto;
+        }
+        .card {
+            background: white;
+            border-radius: 8px;
+            padding: 1rem 1.25rem;
+            margin-bottom: 1.5rem;
+            box-shadow: 0 2px 6px rgba(0,0,0,0.08);
+        }
+        label {
+            font-weight: 600;
+            display: block;
+            margin-bottom: 0.4rem;
+        }
+        input[type="text"],
+        textarea {
+            width: 100%;
+            box-sizing: border-box;
+            padding: 0.5rem 0.6rem;
+            border-radius: 6px;
+            border: 1px solid #ccc;
+            font-size: 0.95rem;
+            font-family: inherit;
+        }
+        textarea {
+            min-height: 130px;
+            resize: vertical;
+        }
+        button {
+            margin-top: 0.7rem;
+            padding: 0.5rem 1.1rem;
+            border-radius: 6px;
+            border: none;
+            background: #2563eb;
+            color: white;
+            font-weight: 600;
+            cursor: pointer;
+        }
+        button:hover {
+            background: #1d4ed8;
+        }
+        .error {
+            color: #b91c1c;
+            font-weight: 600;
+            margin: 0.5rem 0;
+        }
+        pre {
+            background: #0f172a;
+            color: #e5e7eb;
+            padding: 0.75rem;
+            border-radius: 6px;
+            font-size: 0.85rem;
+            overflow-x: auto;
+        }
+        .result-title {
+            margin-top: 0;
+            font-size: 1.05rem;
+            margin-bottom: 0.5rem;
+        }
     </style>
 </head>
 <body>
-
+<div class="container">
     <h1>Analyseur Centris</h1>
 
-    <form method="POST">
-        <input type="text" name="url" placeholder="Collez un lien Centris ici">
-        <button type="submit">Analyser</button>
-    </form>
-
     {% if error %}
-        <p class="error">{{ error }}</p>
+        <div class="card">
+            <p class="error">{{ error }}</p>
+        </div>
     {% endif %}
 
-    {% if result %}
+    <!-- 🔹 MODE 1 : Une seule annonce (comme avant) -->
     <div class="card">
-        <div><span class="label">Prix :</span> {{ result["prix"] }}</div>
-        <div><span class="label">NOI :</span> {{ result["noi"] }}</div>
-        <div><span class="label">Cap rate :</span> {{ result["cap_rate"] }}%</</div>
-        <div><span class="label">Cashflow :</span> {{ result["cashflow"] }}</div>
-        <hr>
-        <div><span class="label">Taxes municipales :</span> {{ result["taxes_municipales"] }}</div>
-        <div><span class="label">Taxes scolaires :</span> {{ result["taxes_scolaires"] }}</div>
-        <div><span class="label">Revenu brut potentiel :</span> {{ result["revenu_brut_potentiel"] }}</div>
+        <h2 class="result-title">1 seule annonce</h2>
+        <form method="POST">
+            <input type="hidden" name="mode" value="single">
+            <label for="content">
+                Lien Centris <strong>OU</strong> contenu complet de la page :
+            </label>
+            <textarea id="content" name="content"
+                      placeholder="Exemples :
+https://www.centris.ca/fr/plex~a-vendre~montreal-ile/12345678
+(ou coller ici tout le HTML de la page Centris)"></textarea>
+            <button type="submit">Analyser cette annonce</button>
+        </form>
     </div>
+
+    <!-- 🔹 MODE 2 : Plusieurs annonces (multi-liens) -->
+    <div class="card">
+        <h2 class="result-title">Plusieurs annonces (liens multiples)</h2>
+        <form method="POST">
+            <input type="hidden" name="mode" value="batch">
+            <label for="urls">
+                Liens Centris (un lien par ligne) :
+            </label>
+            <textarea id="urls" name="urls"
+                      placeholder="https://www.centris.ca/fr/plex~a-vendre~montreal-ile/12345678
+https://www.centris.ca/fr/plex~a-vendre~montreal-ile/23456789
+https://www.centris.ca/fr/plex~a-vendre~montreal-ile/34567890"></textarea>
+            <button type="submit">Analyser toutes les annonces</button>
+        </form>
+    </div>
+
+    <!-- Résultat mode 1 -->
+    {% if result %}
+        <div class="card">
+            <h2 class="result-title">Résultat (1 annonce)</h2>
+            <pre>{{ result | tojson(indent=2) }}</pre>
+        </div>
     {% endif %}
 
+    <!-- Résultats mode 2 -->
+    {% if batch_results %}
+        <div class="card">
+            <h2 class="result-title">Résultats (plusieurs annonces)</h2>
+            {% for item in batch_results %}
+                <div style="margin-bottom: 1rem; border-bottom: 1px solid #e5e7eb; padding-bottom: 0.8rem;">
+                    <strong>Annonce {{ loop.index }} :</strong><br>
+                    <small>{{ item.url }}</small>
+                    {% if item.error %}
+                        <p class="error">{{ item.error }}</p>
+                    {% else %}
+                        <pre>{{ item.data | tojson(indent=2) }}</pre>
+                    {% endif %}
+                </div>
+            {% endfor %}
+        </div>
+    {% endif %}
+</div>
 </body>
 </html>
