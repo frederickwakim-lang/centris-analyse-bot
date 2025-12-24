@@ -1,22 +1,35 @@
 import os
-from dotenv import load_dotenv
 from flask import Flask, render_template, request, jsonify
+from dotenv import load_dotenv
+import requests
+
 from centris_analyzer import analyser_centris
 
-# Charge les variables d'env (.env en local, Render en prod)
 load_dotenv()
 
 app = Flask(__name__)
 
 
-# ---------------------------------------------------------
-#  Page d’accueil : formulaire + affichage résultats
-# ---------------------------------------------------------
+def fetch_html_from_url(url: str) -> str:
+    """Télécharge une page (Centris) avec un vrai User-Agent."""
+    headers = {
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/121.0.0.0 Safari/537.36"
+        ),
+        "Accept-Language": "fr-CA,fr;q=0.9,en;q=0.8",
+    }
+    resp = requests.get(url, headers=headers, timeout=30)
+    resp.raise_for_status()
+    return resp.text
+
+
 @app.route("/", methods=["GET", "POST"])
 def index():
-    error = None
     result = None
     batch_results = None
+    error = None
 
     if request.method == "POST":
         mode = request.form.get("mode", "single")
@@ -24,15 +37,19 @@ def index():
         urls_text = (request.form.get("urls") or "").strip()
 
         try:
-            # --- MODE 1 : une seule annonce (URL ou HTML collé) ---
+            # ----- MODE 1 : UNE SEULE ANNONCE -----
             if mode == "single":
                 if not content:
                     error = "Veuillez entrer une URL ou du HTML."
                 else:
-                    # analyser_centris gère URL OU HTML complet
-                    result = analyser_centris(content)
+                    if content.startswith("http"):
+                        html = fetch_html_from_url(content)
+                    else:
+                        html = content
 
-            # --- MODE 2 : plusieurs liens (un par ligne) ---
+                    result = analyser_centris(html)
+
+            # ----- MODE 2 : PLUSIEURS LIENS -----
             elif mode == "batch":
                 urls = [u.strip() for u in urls_text.splitlines() if u.strip()]
                 if not urls:
@@ -42,7 +59,8 @@ def index():
                     for u in urls:
                         item = {"url": u}
                         try:
-                            data = analyser_centris(u)
+                            html = fetch_html_from_url(u)
+                            data = analyser_centris(html)
                             item["data"] = data
                         except Exception as e:
                             item["error"] = str(e)
@@ -53,36 +71,36 @@ def index():
 
     return render_template(
         "index.html",
-        error=error,
         result=result,
         batch_results=batch_results,
+        error=error,
     )
 
 
-# ---------------------------------------------------------
-#  API /analyze — utilisée par ton watcher
-# ---------------------------------------------------------
 @app.route("/analyze", methods=["POST"])
 def api_analyze():
     """
-    Endpoint API pour le watcher et les tests (POST JSON).
-
-    Body JSON :
+    Endpoint API pour ton watcher ou des scripts.
+    JSON d'entrée :
       - soit {"url": "https://..."}
       - soit {"content": "<html>...</html>"}
     """
+    body = request.get_json(silent=True) or {}
+
+    url = body.get("url")
+    content = body.get("content")
+
+    if not url and not content:
+        return jsonify({"error": "Il faut fournir 'url' ou 'content'."}), 400
+
     try:
-        body = request.get_json(silent=True) or {}
-        url = (body.get("url") or "").strip()
-        content = (body.get("content") or "").strip()
+        if url:
+            html = fetch_html_from_url(url)
+        else:
+            html = content
 
-        if not url and not content:
-            return jsonify({"error": "Il faut fournir 'url' ou 'content'."}), 400
-
-        input_content = url or content
-        data = analyser_centris(input_content)
-        return jsonify(data), 200
-
+        data = analyser_centris(html)
+        return jsonify(data)
     except Exception as e:
         return jsonify({"error": f"Erreur calculs/analyse: {e}"}), 500
 
@@ -92,8 +110,5 @@ def health():
     return "OK", 200
 
 
-# ---------------------------------------------------------
-#  Lancer l’app localement (dev)
-# ---------------------------------------------------------
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=int(os.getenv("PORT", "5000")), debug=True)
+    app.run(debug=True, port=int(os.getenv("PORT", "5000")))

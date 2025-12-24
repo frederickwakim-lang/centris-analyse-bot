@@ -1,22 +1,38 @@
 import os
 import json
+import requests
 from bs4 import BeautifulSoup
 from openai import OpenAI
 
-# Client OpenAI (clé prise dans .env)
+# Clé API OpenAI depuis .env
 client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 
 # On limite la taille du texte envoyé au modèle
-MAX_CHARS_FOR_GPT = int(os.getenv("MAX_CHARS_FOR_GPT", "9000"))
+MAX_CHARS_FOR_GPT = int(os.getenv("MAX_CHARS_FOR_GPT", "8000"))
 
 
-# =========================================================
-# 1) NETTOYAGE DU HTML
-# =========================================================
-def _clean_html(html: str) -> str:
+def fetch_html(url: str) -> str:
     """
-    Enlève scripts, styles, etc. et garde seulement du texte brut.
-    On tronque à MAX_CHARS_FOR_GPT pour ne pas exploser le contexte.
+    Télécharge le HTML brut d'une URL Centris avec un vrai User-Agent
+    (quand on l'utilise en local).
+    """
+    headers = {
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/121.0.0.0 Safari/537.36"
+        ),
+        "Accept-Language": "fr-CA,fr;q=0.9,en;q=0.8",
+    }
+    resp = requests.get(url, headers=headers, timeout=30)
+    resp.raise_for_status()
+    return resp.text
+
+
+def clean_html(html: str) -> str:
+    """
+    Nettoie le HTML pour ne garder que du texte.
+    On enlève scripts, styles, etc., puis on tronque pour ne pas exploser le contexte.
     """
     soup = BeautifulSoup(html, "html.parser")
     for tag in soup(["script", "style", "noscript", "meta", "link"]):
@@ -25,22 +41,15 @@ def _clean_html(html: str) -> str:
     return text[:MAX_CHARS_FOR_GPT]
 
 
-# =========================================================
-# 2) APPEL OPENAI : EXTRACTION DES DONNÉES BRUTES
-# =========================================================
-def _call_openai_extraction(text: str) -> dict:
+def analyze_with_openai(text: str) -> dict:
     """
-    Envoie le texte nettoyé à OpenAI et demande un JSON structuré
-    avec prix, revenus, taxes, etc. (mais SANS calculer le cap rate).
+    Envoie le texte nettoyé de la fiche Centris à OpenAI
+    et demande un JSON structuré.
     """
 
-    system_message = """
+    system = """
 Tu es un expert en analyse immobilière au Québec.
-
-Ton rôle : EXTRAIRE les informations chiffrées d'une annonce Centris
-(et uniquement ça). NE FAIS PAS DE CALCULS, ils seront faits par le backend.
-
-Tu dois retourner STRICTEMENT un JSON avec cette structure :
+Tu DOIS retourner strictement un JSON avec cette structure (clés exactes) :
 
 {
   "property_overview": {
@@ -64,50 +73,47 @@ Tu dois retourner STRICTEMENT un JSON avec cette structure :
     "entretien_annuel": number | null
   },
   "metrics": {
-    "cap_rate_estime": null,
-    "cashflow_mensuel_estime": null,
-    "noi_estime_annuel": null
+    "cap_rate_estime": number | null,
+    "cashflow_mensuel_estime": number | null,
+    "noi_estime_annuel": number | null
   }
 }
 
-RÈGLES IMPORTANTES :
-- UTILISE des nombres (pas de strings) pour les montants et pourcentages.
-- Si une information n'est pas clairement trouvable : mets null.
-- Ne mets JAMAIS "N/A" ou du texte dans un champ numérique.
-- NE CALCULE PAS le cap rate, ni le cashflow : laisse-les à null.
+Règles importantes :
+- Utilise des nombres (pas de strings) pour les montants et pourcentages.
+- Si une information n'est clairement pas trouvable dans le texte, mets null (et NON 0).
+- Si le revenu brut potentiel annuel est clair (total des loyers sur 12 mois), remplis-le.
+- Si le prix de vente est clair, remplis-le.
+- Si tu peux raisonnablement déduire un champ à partir du texte, fais-le.
 """
 
-    user_message = f"""
-Voici le texte brut d'une annonce immobilière (souvent Centris).
-Analyse-la et remplis le JSON SELON LES RÈGLES ci-dessus.
+    user = f"""
+Voici le texte brut d'une annonce Centris (Québec). Analyse-la et remplis le JSON demandé.
 
 Texte :
 ```text
 {text}
 ```"""
 
-    resp = client.responses.create(
+    completion = client.chat.completions.create(
         model="gpt-4o-mini",
-        input=[
-            {"role": "system", "content": system_message},
-            {"role": "user", "content": user_message},
-        ],
         response_format={"type": "json_object"},
+        messages=[
+            {"role": "system", "content": system},
+            {"role": "user", "content": user},
+        ],
     )
 
-    raw = resp.output[0].content[0].text
+    raw = completion.choices[0].message.content
     return json.loads(raw)
 
 
-# =========================================================
-# 3) CALCULS : NOI, CAP RATE, CASHFLOW
-# =========================================================
 def _to_num(v):
-    """Convertit une valeur en float si possible, sinon None."""
+    """Convertit v en float si possible, sinon None."""
     if isinstance(v, (int, float)):
         return float(v)
     if isinstance(v, str):
-        s = v.strip().replace("\u00a0", " ").replace(" ", "").replace(",", ".")
+        s = v.strip().replace(" ", "").replace("\u00a0", "").replace(",", ".")
         try:
             return float(s)
         except ValueError:
@@ -115,14 +121,10 @@ def _to_num(v):
     return None
 
 
-def _enrich_metrics(data: dict) -> dict:
+def enrich_results(data: dict) -> dict:
     """
-    Utilise les champs extraits (prix, revenus, taxes, entretien, vacance)
-    pour calculer :
-      - noi_estime_annuel
-      - cap_rate_estime
-      - cashflow_mensuel_estime
-    Si infos insuffisantes → on laisse les métriques à null.
+    À partir de ce que le modèle a sorti, calcule NOI, cap rate, cashflow.
+    Si les infos sont insuffisantes, on laisse les champs à null.
     """
 
     property_overview = data.get("property_overview") or {}
@@ -142,18 +144,15 @@ def _enrich_metrics(data: dict) -> dict:
 
     vacance_pct = _to_num(hypotheses.get("vacance_pourcentage"))
     if vacance_pct is None:
-        vacance_pct = 0.05  # 5 % par défaut
+        vacance_pct = 0.05  # par défaut 5 %
 
-    # Si on a au moins prix + revenu brut, on peut calculer
     if prix is not None and prix > 0 and revenu_brut is not None:
         revenu_net_apres_vacance = revenu_brut * (1 - vacance_pct)
         depenses_totales = taxes_mun + taxes_sco + assurances + autres + entretien
         noi = revenu_net_apres_vacance - depenses_totales
 
         cap_rate = (noi / prix) * 100.0
-
-        # Hypothèse simple : 6 % d'intérêt / an sur le prix, payé sur 12 mois
-        mensualite_hypotheque = (prix * 0.06) / 12.0
+        mensualite_hypotheque = (prix * 0.06) / 12.0  # hypothèse simple
         cashflow_mensuel = (noi / 12.0) - mensualite_hypotheque
 
         metrics["noi_estime_annuel"] = round(noi, 2)
@@ -168,16 +167,19 @@ def _enrich_metrics(data: dict) -> dict:
     return data
 
 
-# =========================================================
-# 4) FONCTION PUBLIQUE UTILISÉE PAR app.py
-# =========================================================
-def analyser_centris(html: str) -> dict:
+def analyser_centris(input_content: str) -> dict:
     """
-    Point d’entrée appelé par app.py.
-    On reçoit du HTML complet (déjà téléchargé côté watcher ou côté serveur),
-    on nettoie, on envoie à OpenAI, puis on calcule les métriques.
+    Point d'entrée : prend soit une URL, soit du HTML.
+    - Si ça commence par http : on télécharge la page (pour usage local).
+    - Sinon : on considère que c'est du HTML brut.
     """
-    cleaned = _clean_html(html)
-    base = _call_openai_extraction(cleaned)
-    enriched = _enrich_metrics(base)
+
+    if input_content.strip().startswith("http"):
+        html = fetch_html(input_content.strip())
+    else:
+        html = input_content
+
+    cleaned = clean_html(html)
+    base = analyze_with_openai(cleaned)
+    enriched = enrich_results(base)
     return enriched
