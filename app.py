@@ -60,7 +60,12 @@ def clean_html_for_llm(html: str) -> str:
 def call_openai_structured(text_clean: str) -> dict:
     """
     Envoie le texte nettoyé à OpenAI et récupère un JSON structuré.
-    Utilise gpt-4o-mini via l'API Responses.
+
+    ⚠ IMPORTANT :
+    On n'utilise PAS `response_format` car la version de la lib OpenAI
+    sur Render ne supporte pas ce paramètre pour Responses.create().
+    On donne donc des instructions très strictes au modèle pour
+    qu'il renvoie uniquement du JSON, puis on fait `json.loads` dessus.
     """
     system_msg = (
         "Tu es un analyste immobilier spécialisé au Québec. "
@@ -75,7 +80,9 @@ Voici le texte d'une annonce immobilière :
 {text_clean}
 \"\"\"
 
-Analyse cette annonce et renvoie UNIQUEMENT un JSON avec la structure suivante :
+
+Analyse cette annonce et renvoie UNIQUEMENT un JSON avec la structure suivante
+(et rien d'autre, pas de texte autour, pas de commentaires) :
 
 {{
   "property_overview": {{
@@ -104,28 +111,42 @@ Analyse cette annonce et renvoie UNIQUEMENT un JSON avec la structure suivante :
   }}
 }}
 
+Rappels IMPORTANTS :
 - Si une donnée n'est pas trouvable, mets-la à null.
-- Ne renvoie rien d'autre que ce JSON.
+- Ne renvoie STRICTEMENT RIEN D'AUTRE que ce JSON valide.
+- Pas de texte avant ou après, pas de ```json, pas de commentaires.
 """
 
+    # ⚠️ Ici : PAS de response_format
     resp = client.responses.create(
-        model="gpt-4o-mini",
+        model=os.getenv("OPENAI_MODEL", "gpt-4o-mini"),
         input=[
             {"role": "system", "content": system_msg},
             {"role": "user", "content": user_msg},
         ],
-        response_format={"type": "json_object"},
+        # PAS de `response_format=...` pour rester compatible
     )
 
     # Récupère le texte de sortie
     # (format Responses : output[0].content[0].text)
-    output_text = resp.output[0].content[0].text
+    try:
+        output_text = resp.output[0].content[0].text
+    except Exception as e:
+        # Si la structure change, on renvoie tout pour debug
+        return {
+            "error": f"Structure de réponse OpenAI inattendue: {e}",
+            "raw_response": str(resp),
+        }
 
+    # On essaie de parser en JSON
     try:
         data = json.loads(output_text)
-    except Exception:
+    except Exception as e:
         # Si jamais le JSON est mal formé, on renvoie brut pour debug
-        data = {"raw": output_text}
+        data = {
+            "error": f"Impossible de parser le JSON renvoyé par OpenAI: {e}",
+            "raw": output_text,
+        }
 
     return data
 
