@@ -130,7 +130,8 @@
   {% if result %}
     <div class="card">
       <div class="section-title">Résultat (mode une annonce)</div>
-      <pre>{{ result | tojson(indent=2, ensure_ascii=False) }}</pre>
+      <!-- ensure_ascii enlevé ici -->
+      <pre>{{ result | tojson(indent=2) }}</pre>
     </div>
   {% endif %}
 
@@ -146,7 +147,8 @@
                 {{ item.error }}
               </div>
             {% elif item.data %}
-              <pre style="margin-top: 0.5rem;">{{ item.data | tojson(indent=2, ensure_ascii=False) }}</pre>
+              <!-- ensure_ascii enlevé ici aussi -->
+              <pre style="margin-top: 0.5rem;">{{ item.data | tojson(indent=2) }}</pre>
             {% else %}
               <div style="margin-top: 0.5rem; font-style: italic;">
                 Aucun résultat.
