@@ -1,149 +1,161 @@
 <!DOCTYPE html>
 <html lang="fr">
 <head>
-    <meta charset="UTF-8">
-    <title>Analyseur Centris</title>
-    <style>
-        body {
-            font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
-            background: #f5f5f5;
-            margin: 0;
-            padding: 2rem;
-        }
-        h1 {
-            text-align: center;
-            margin-bottom: 1rem;
-        }
-        .container {
-            max-width: 1100px;
-            margin: 0 auto;
-        }
-        .card {
-            background: white;
-            border-radius: 8px;
-            padding: 1rem 1.25rem;
-            margin-bottom: 1.5rem;
-            box-shadow: 0 2px 6px rgba(0,0,0,0.08);
-        }
-        label {
-            font-weight: 600;
-            display: block;
-            margin-bottom: 0.4rem;
-        }
-        input[type="text"],
-        textarea {
-            width: 100%;
-            box-sizing: border-box;
-            padding: 0.5rem 0.6rem;
-            border-radius: 6px;
-            border: 1px solid #ccc;
-            font-size: 0.95rem;
-            font-family: inherit;
-        }
-        textarea {
-            min-height: 130px;
-            resize: vertical;
-        }
-        button {
-            margin-top: 0.7rem;
-            padding: 0.5rem 1.1rem;
-            border-radius: 6px;
-            border: none;
-            background: #2563eb;
-            color: white;
-            font-weight: 600;
-            cursor: pointer;
-        }
-        button:hover {
-            background: #1d4ed8;
-        }
-        .error {
-            color: #b91c1c;
-            font-weight: 600;
-            margin: 0.5rem 0;
-        }
-        pre {
-            background: #0f172a;
-            color: #e5e7eb;
-            padding: 0.75rem;
-            border-radius: 6px;
-            font-size: 0.85rem;
-            overflow-x: auto;
-        }
-        .result-title {
-            margin-top: 0;
-            font-size: 1.05rem;
-            margin-bottom: 0.5rem;
-        }
-    </style>
+  <meta charset="UTF-8">
+  <title>Analyseur Centris</title>
+  <style>
+    body {
+      font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      max-width: 900px;
+      margin: 2rem auto;
+      padding: 1rem 1.5rem;
+      background: #f5f5f5;
+    }
+    h1 {
+      text-align: center;
+      margin-bottom: 1rem;
+    }
+    .card {
+      background: white;
+      padding: 1rem 1.5rem;
+      border-radius: 8px;
+      box-shadow: 0 2px 8px rgba(0,0,0,0.05);
+      margin-bottom: 1.5rem;
+    }
+    textarea {
+      width: 100%;
+      min-height: 120px;
+      resize: vertical;
+      padding: 0.5rem;
+      font-family: monospace;
+    }
+    .row {
+      margin-bottom: 1rem;
+    }
+    .label {
+      font-weight: 600;
+      display: block;
+      margin-bottom: 0.25rem;
+    }
+    .error {
+      background: #ffe5e5;
+      color: #b80000;
+      padding: 0.75rem 1rem;
+      border-radius: 6px;
+      margin-bottom: 1rem;
+      border: 1px solid #ffb3b3;
+    }
+    pre {
+      background: #111827;
+      color: #e5e7eb;
+      padding: 1rem;
+      border-radius: 8px;
+      overflow-x: auto;
+      font-size: 0.9rem;
+    }
+    button {
+      padding: 0.6rem 1.2rem;
+      border-radius: 6px;
+      border: none;
+      background: #2563eb;
+      color: white;
+      font-weight: 600;
+      cursor: pointer;
+    }
+    button:hover {
+      background: #1d4ed8;
+    }
+    .mode-switch {
+      display: flex;
+      gap: 1rem;
+      margin-bottom: 1rem;
+    }
+    .mode-switch label {
+      display: flex;
+      align-items: center;
+      gap: 0.35rem;
+      cursor: pointer;
+    }
+    .section-title {
+      font-weight: 600;
+      margin-bottom: 0.5rem;
+      margin-top: 1rem;
+    }
+    ul {
+      padding-left: 1.2rem;
+    }
+  </style>
 </head>
 <body>
-<div class="container">
-    <h1>Analyseur Centris</h1>
+  <h1>Analyseur Centris</h1>
 
+  <div class="card">
     {% if error %}
-        <div class="card">
-            <p class="error">{{ error }}</p>
-        </div>
+      <div class="error">
+        {{ error }}
+      </div>
     {% endif %}
 
-    <!-- 🔹 MODE 1 : Une seule annonce (comme avant) -->
+    <form method="POST">
+      <div class="row">
+        <div class="label">Mode d'analyse</div>
+        <div class="mode-switch">
+          <label>
+            <input type="radio" name="mode" value="single"
+                   {% if not batch_results %}checked{% endif %}>
+            Une seule annonce (URL ou HTML collé)
+          </label>
+          <label>
+            <input type="radio" name="mode" value="batch"
+                   {% if batch_results %}checked{% endif %}>
+            Plusieurs liens (un par ligne)
+          </label>
+        </div>
+      </div>
+
+      <div class="row">
+        <div class="label">Une seule annonce (URL Centris ou HTML collé)</div>
+        <textarea name="content" placeholder="https://www.centris.ca/fr/plex~a-vendre~..."></textarea>
+      </div>
+
+      <div class="row">
+        <div class="label">Mode batch (plusieurs URLs, une par ligne)</div>
+        <textarea name="urls" placeholder="https://www.centris.ca/fr/duplex~a-vendre~...&#10;https://www.centris.ca/fr/triplex~a-vendre~..."></textarea>
+      </div>
+
+      <button type="submit">Analyser</button>
+    </form>
+  </div>
+
+  {% if result %}
     <div class="card">
-        <h2 class="result-title">1 seule annonce</h2>
-        <form method="POST">
-            <input type="hidden" name="mode" value="single">
-            <label for="content">
-                Lien Centris <strong>OU</strong> contenu complet de la page :
-            </label>
-            <textarea id="content" name="content"
-                      placeholder="Exemples :
-https://www.centris.ca/fr/plex~a-vendre~montreal-ile/12345678
-(ou coller ici tout le HTML de la page Centris)"></textarea>
-            <button type="submit">Analyser cette annonce</button>
-        </form>
+      <div class="section-title">Résultat (mode une annonce)</div>
+      <pre>{{ result | tojson(indent=2, ensure_ascii=False) }}</pre>
     </div>
+  {% endif %}
 
-    <!-- 🔹 MODE 2 : Plusieurs annonces (multi-liens) -->
+  {% if batch_results %}
     <div class="card">
-        <h2 class="result-title">Plusieurs annonces (liens multiples)</h2>
-        <form method="POST">
-            <input type="hidden" name="mode" value="batch">
-            <label for="urls">
-                Liens Centris (un lien par ligne) :
-            </label>
-            <textarea id="urls" name="urls"
-                      placeholder="https://www.centris.ca/fr/plex~a-vendre~montreal-ile/12345678
-https://www.centris.ca/fr/plex~a-vendre~montreal-ile/23456789
-https://www.centris.ca/fr/plex~a-vendre~montreal-ile/34567890"></textarea>
-            <button type="submit">Analyser toutes les annonces</button>
-        </form>
+      <div class="section-title">Résultats (mode batch)</div>
+      <ul>
+        {% for item in batch_results %}
+          <li style="margin-bottom: 1rem;">
+            <div><strong>URL :</strong> {{ item.url }}</div>
+            {% if item.error %}
+              <div class="error" style="margin-top: 0.5rem;">
+                {{ item.error }}
+              </div>
+            {% elif item.data %}
+              <pre style="margin-top: 0.5rem;">{{ item.data | tojson(indent=2, ensure_ascii=False) }}</pre>
+            {% else %}
+              <div style="margin-top: 0.5rem; font-style: italic;">
+                Aucun résultat.
+              </div>
+            {% endif %}
+          </li>
+        {% endfor %}
+      </ul>
     </div>
-
-    <!-- Résultat mode 1 -->
-    {% if result %}
-        <div class="card">
-            <h2 class="result-title">Résultat (1 annonce)</h2>
-            <pre>{{ result | tojson(indent=2) }}</pre>
-        </div>
-    {% endif %}
-
-    <!-- Résultats mode 2 -->
-    {% if batch_results %}
-        <div class="card">
-            <h2 class="result-title">Résultats (plusieurs annonces)</h2>
-            {% for item in batch_results %}
-                <div style="margin-bottom: 1rem; border-bottom: 1px solid #e5e7eb; padding-bottom: 0.8rem;">
-                    <strong>Annonce {{ loop.index }} :</strong><br>
-                    <small>{{ item.url }}</small>
-                    {% if item.error %}
-                        <p class="error">{{ item.error }}</p>
-                    {% else %}
-                        <pre>{{ item.data | tojson(indent=2) }}</pre>
-                    {% endif %}
-                </div>
-            {% endfor %}
-        </div>
-    {% endif %}
-</div>
+  {% endif %}
 </body>
 </html>
