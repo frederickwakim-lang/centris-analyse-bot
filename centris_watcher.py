@@ -1,5 +1,5 @@
 from dotenv import load_dotenv
-load_dotenv()  # Charge les variables du .env
+load_dotenv()  # Charge .env en local (sur Render, il ignore si pas là)
 
 import os
 import json
@@ -14,7 +14,7 @@ from bs4 import BeautifulSoup
 
 CENTRIS_SEARCH_URL = os.getenv(
     "CENTRIS_SEARCH_URL",
-    "https://www.centris.ca/fr/plex~a-vendre?uc=0",
+    "https://www.centris.ca/fr/plex~a-vendre?uc=0",  # Tous les plex au Québec
 )
 
 ANALYZER_URL = os.getenv(
@@ -24,7 +24,11 @@ ANALYZER_URL = os.getenv(
 
 DISCORD_WEBHOOK_URL = os.getenv("DISCORD_WEBHOOK_URL")
 
+# Pause entre deux appels GPT (pour respecter le rate limit)
 REQUEST_INTERVAL_SECONDS = int(os.getenv("REQUEST_INTERVAL_SECONDS", "40"))
+
+# Pause entre deux SCANS COMPLETS de la page Centris (ex : 5 min)
+FULL_SCAN_INTERVAL_SECONDS = int(os.getenv("FULL_SCAN_INTERVAL_SECONDS", "300"))
 
 SEEN_FILE = "seen_listings.json"
 
@@ -105,7 +109,7 @@ def analyze_listing(url: str):
     if resp.status_code != 200:
         print(f"  ❌ Erreur HTTP {resp.status_code} : {resp.text[:300]}")
         if "rate limit" in resp.text.lower():
-            print("  ⚠️ Rate limit détecté, on stoppe ce run proprement.")
+            print("  ⚠️ Rate limit détecté, on stoppe ce cycle proprement.")
         return None
 
     try:
@@ -120,7 +124,7 @@ def analyze_listing(url: str):
 
 
 # ===========================
-# CALCULS 100% BASÉS SUR LES CHIFFRES RÉELS
+# CALCULS 100% BASÉS SUR LES VRAIS CHIFFRES
 # ===========================
 
 def _as_number_or_zero(v):
@@ -149,7 +153,7 @@ def enrich_metrics_without_defaults(data: dict) -> dict:
     prix = po.get("prix")
     revenu_brut = rev.get("revenu_brut_potentiel_annuel")
 
-    # Si on n’a pas au moins prix + revenu, impossible de calculer
+    # Si pas de prix ou pas de revenu -> pas de calcul possible
     if not isinstance(prix, (int, float)) or not isinstance(revenu_brut, (int, float)) or prix <= 0:
         data["metrics"] = metrics
         return data
@@ -160,20 +164,15 @@ def enrich_metrics_without_defaults(data: dict) -> dict:
     autres = _as_number_or_zero(dep.get("autres_depenses_connues"))
 
     vacance = hyp.get("vacance_pourcentage")
-    vacance = vacance if isinstance(vacance, (int, float)) else 0.0  # si pas de % donné, on considère 0
+    vacance = vacance if isinstance(vacance, (int, float)) else 0.0
     entretien = hyp.get("entretien_annuel")
-    entretien = entretien if isinstance(entretien, (int, float)) else 0.0  # si pas donné, on considère 0
+    entretien = entretien if isinstance(entretien, (int, float)) else 0.0
 
-    # Revenu net en tenant compte de la vacance si fournie
     revenu_net = revenu_brut * (1 - vacance)
-
-    # Total des dépenses connues (celles qui ont un vrai chiffre)
     depenses_totales = taxes_mun + taxes_sco + assurances + autres + entretien
 
     noi = revenu_net - depenses_totales
     cap_rate = (noi / prix) * 100
-
-    # Cashflow mensuel AVANT dette (juste NOI / 12)
     cashflow_mensuel = noi / 12
 
     metrics["noi_estime_annuel"] = round(noi, 2)
@@ -185,10 +184,7 @@ def enrich_metrics_without_defaults(data: dict) -> dict:
 
 
 def _replace_none_for_display(obj):
-    """
-    Pour Discord : remplace None par 'N/A' dans l'affichage,
-    MAIS on ne modifie pas les nombres.
-    """
+    """Pour Discord : remplace None par 'N/A' uniquement pour l'affichage."""
     if isinstance(obj, dict):
         return {k: _replace_none_for_display(v) for k, v in obj.items()}
     if isinstance(obj, list):
@@ -199,12 +195,11 @@ def _replace_none_for_display(obj):
 
 
 def send_discord_message(data: dict, url: str):
-    """Enrichit les metrics, puis envoie le JSON sur Discord."""
+    """Enrichit avec les metrics puis envoie sur Discord."""
     if not DISCORD_WEBHOOK_URL:
         print("⚠️ Aucun webhook Discord configuré.")
         return
 
-    # Ajout NOI / cap / cashflow basés uniquement sur les vrais chiffres
     enriched = enrich_metrics_without_defaults(data)
     display_data = _replace_none_for_display(enriched)
 
@@ -225,12 +220,13 @@ def send_discord_message(data: dict, url: str):
 
 
 # ===========================
-# BOUCLE PRINCIPALE
+# UN CYCLE COMPLET DE SCAN
 # ===========================
 
-def main():
+def run_one_full_scan():
+    """Un scan complet : récupère la page, détecte les nouvelles annonces, les analyse, envoie sur Discord."""
     seen = load_seen_ids()
-    print(f"📂 {len(seen)} annonces déjà analysées.\n")
+    print(f"📂 {len(seen)} annonces déjà analysées avant ce scan.\n")
 
     urls = get_listing_urls_from_search()
 
@@ -254,13 +250,37 @@ def main():
             seen.add(listing_id)
             save_seen_ids(seen)
 
-        print(f"⏳ Pause {REQUEST_INTERVAL_SECONDS} sec…\n")
+        print(f"⏳ Pause {REQUEST_INTERVAL_SECONDS} sec avant la prochaine annonce…\n")
         try:
             time.sleep(REQUEST_INTERVAL_SECONDS)
         except KeyboardInterrupt:
-            print("⛔ Arrêt manuel par l'utilisateur.")
+            print("⛔ Arrêt manuel pendant le scan.")
+            raise
+
+
+# ===========================
+# BOUCLE INFINIE POUR RENDER
+# ===========================
+
+def main_loop():
+    """Boucle infinie : Render va lancer ce script et il tournera en continu."""
+    while True:
+        print("🚀 Nouveau scan complet Centris…")
+        try:
+            run_one_full_scan()
+        except KeyboardInterrupt:
+            print("⛔ Arrêt manuel demandé. On quitte proprement.")
+            break
+        except Exception as e:
+            print(f"💥 Erreur au niveau du cycle : {e}")
+
+        print(f"🕒 Pause {FULL_SCAN_INTERVAL_SECONDS} sec avant le prochain scan complet…\n")
+        try:
+            time.sleep(FULL_SCAN_INTERVAL_SECONDS)
+        except KeyboardInterrupt:
+            print("⛔ Arrêt manuel pendant la pause. On quitte.")
             break
 
 
 if __name__ == "__main__":
-    main()
+    main_loop()
