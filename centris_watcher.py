@@ -22,6 +22,7 @@ SEEN_FILE = "seen_listings.json"
 
 
 def load_seen_ids():
+    """Charge la liste des IDs déjà analysés depuis le fichier JSON local."""
     try:
         with open(SEEN_FILE, "r", encoding="utf-8") as f:
             return set(json.load(f))
@@ -30,16 +31,19 @@ def load_seen_ids():
 
 
 def save_seen_ids(ids_set):
+    """Sauvegarde la liste des IDs déjà analysés dans le fichier JSON local."""
     with open(SEEN_FILE, "w", encoding="utf-8") as f:
         json.dump(sorted(list(ids_set)), f, ensure_ascii=False, indent=2)
 
 
 def extract_listing_id(url: str):
+    """Extrait l'ID Centris (7–8 chiffres) d'une URL."""
     m = re.search(r"/(\d{7,8})(?:[^\d]|$)", url)
     return m.group(1) if m else None
 
 
 def get_listing_urls_from_search():
+    """Télécharge la page de recherche et récupère toutes les URLs de fiches."""
     print(f"🔎 Téléchargement : {CENTRIS_SEARCH_URL}")
     resp = requests.get(
         CENTRIS_SEARCH_URL,
@@ -67,14 +71,18 @@ def get_listing_urls_from_search():
 
 
 def analyze_listing(url: str):
+    """Envoie l'URL d'une fiche à ton analyseur Render et retourne le JSON analysé."""
     print(f"🧠 Analyse : {url}")
     try:
         resp = requests.post(
             ANALYZER_URL,
             json={"url": url},
             headers={"Content-Type": "application/json"},
-            timeout=60,
+            timeout=45,  # ⏱ max 45 secondes pour éviter de rester bloqué trop longtemps
         )
+    except requests.Timeout:
+        print("  ❌ Timeout vers l'analyseur (trop long), on saute cette annonce.")
+        return None
     except Exception as e:
         print(f"  ❌ Erreur réseau : {e}")
         return None
@@ -115,6 +123,7 @@ def main():
             seen.add(listing_id)
             save_seen_ids(seen)
 
+        # Petite pause pour ne pas spammer Centris ni ton analyseur
         time.sleep(2)
 
 
