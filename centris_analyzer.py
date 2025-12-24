@@ -112,16 +112,17 @@ Texte :
 {text}
 ```"""
 
-    resp = client.responses.create(
+    # 👉 ICI : on utilise chat.completions, PAS responses.create
+    completion = client.chat.completions.create(
         model="gpt-4o-mini",
-        input=[
+        response_format={"type": "json_object"},
+        messages=[
             {"role": "system", "content": system_message},
             {"role": "user", "content": user_message},
         ],
-        response_format={"type": "json_object"},
     )
 
-    raw = resp.output[0].content[0].text
+    raw = completion.choices[0].message.content
     return json.loads(raw)
 
 
