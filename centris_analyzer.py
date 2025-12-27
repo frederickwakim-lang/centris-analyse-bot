@@ -1,185 +1,100 @@
-import os
-import json
-import requests
+import re
 from bs4 import BeautifulSoup
-from openai import OpenAI
-
-# Clé API OpenAI depuis .env
-client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
-
-# On limite la taille du texte envoyé au modèle
-MAX_CHARS_FOR_GPT = int(os.getenv("MAX_CHARS_FOR_GPT", "8000"))
 
 
-def fetch_html(url: str) -> str:
-    """
-    Télécharge le HTML brut d'une URL Centris avec un vrai User-Agent
-    (quand on l'utilise en local).
-    """
-    headers = {
-        "User-Agent": (
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-            "AppleWebKit/537.36 (KHTML, like Gecko) "
-            "Chrome/121.0.0.0 Safari/537.36"
-        ),
-        "Accept-Language": "fr-CA,fr;q=0.9,en;q=0.8",
-    }
-    resp = requests.get(url, headers=headers, timeout=30)
-    resp.raise_for_status()
-    return resp.text
+def _to_number(s):
+    if s is None:
+        return None
+    if isinstance(s, (int, float)):
+        return float(s)
+
+    txt = str(s)
+    txt = txt.replace("\u00a0", " ").strip()
+
+    cleaned = re.sub(r"[^0-9,.\-]", "", txt)
+
+    if cleaned in ("", "-", ".", ","):
+        return None
+
+    if cleaned.count(",") == 1 and cleaned.count(".") == 0:
+        cleaned = cleaned.replace(",", ".")
+    else:
+        cleaned = cleaned.replace(",", "")
+
+    try:
+        return float(cleaned)
+    except Exception:
+        return None
 
 
-def clean_html(html: str) -> str:
-    """
-    Nettoie le HTML pour ne garder que du texte.
-    On enlève scripts, styles, etc., puis on tronque pour ne pas exploser le contexte.
-    """
-    soup = BeautifulSoup(html, "html.parser")
-    for tag in soup(["script", "style", "noscript", "meta", "link"]):
-        tag.decompose()
-    text = soup.get_text(separator="\n", strip=True)
-    return text[:MAX_CHARS_FOR_GPT]
-
-
-def analyze_with_openai(text: str) -> dict:
-    """
-    Envoie le texte nettoyé de la fiche Centris à OpenAI
-    et demande un JSON structuré.
-    """
-
-    system = """
-Tu es un expert en analyse immobilière au Québec.
-Tu DOIS retourner strictement un JSON avec cette structure (clés exactes) :
-
-{
-  "property_overview": {
-    "type_propriete": string | null,
-    "ville": string | null,
-    "quartier": string | null,
-    "prix": number | null,
-    "nb_logements": number | null
-  },
-  "revenus": {
-    "revenu_brut_potentiel_annuel": number | null
-  },
-  "depenses_vraies": {
-    "taxes_municipales": number | null,
-    "taxes_scolaires": number | null,
-    "assurances": number | null,
-    "autres_depenses_connues": number | null
-  },
-  "hypotheses": {
-    "vacance_pourcentage": number | null,
-    "entretien_annuel": number | null
-  },
-  "metrics": {
-    "cap_rate_estime": number | null,
-    "cashflow_mensuel_estime": number | null,
-    "noi_estime_annuel": number | null
-  }
-}
-
-Règles importantes :
-- Utilise des nombres (pas de strings) pour les montants et pourcentages.
-- Si une information n'est clairement pas trouvable dans le texte, mets null (et NON 0).
-- Si le revenu brut potentiel annuel est clair (total des loyers sur 12 mois), remplis-le.
-- Si le prix de vente est clair, remplis-le.
-- Si tu peux raisonnablement déduire un champ à partir du texte, fais-le.
-"""
-
-    user = f"""
-Voici le texte brut d'une annonce Centris (Québec). Analyse-la et remplis le JSON demandé.
-
-Texte :
-```text
-{text}
-```"""
-
-    completion = client.chat.completions.create(
-        model="gpt-4o-mini",
-        response_format={"type": "json_object"},
-        messages=[
-            {"role": "system", "content": system},
-            {"role": "user", "content": user},
-        ],
-    )
-
-    raw = completion.choices[0].message.content
-    return json.loads(raw)
-
-
-def _to_num(v):
-    """Convertit v en float si possible, sinon None."""
-    if isinstance(v, (int, float)):
-        return float(v)
-    if isinstance(v, str):
-        s = v.strip().replace(" ", "").replace("\u00a0", "").replace(",", ".")
-        try:
-            return float(s)
-        except ValueError:
-            return None
+def _find_value_near_labels(text: str, labels):
+    t = " ".join(text.split())
+    for lab in labels:
+        m = re.search(rf"{lab}\s*[:\-]?\s*([0-9][0-9\s\u00a0\.,\$]*)", t, flags=re.IGNORECASE)
+        if m:
+            return _to_number(m.group(1))
     return None
 
 
-def enrich_results(data: dict) -> dict:
-    """
-    À partir de ce que le modèle a sorti, calcule NOI, cap rate, cashflow.
-    Si les infos sont insuffisantes, on laisse les champs à null.
-    """
+def analyser_centris(html: str) -> dict:
+    soup = BeautifulSoup(html, "html.parser")
+    text = soup.get_text(" ", strip=True)
 
-    property_overview = data.get("property_overview") or {}
-    revenus = data.get("revenus") or {}
-    depenses = data.get("depenses_vraies") or {}
-    hypotheses = data.get("hypotheses") or {}
-    metrics = data.get("metrics") or {}
+    out = {
+        "__analyzer_version__": "v2-2025-12-27",
 
-    prix = _to_num(property_overview.get("prix"))
-    revenu_brut = _to_num(revenus.get("revenu_brut_potentiel_annuel"))
+        "property_overview": {
+            "type_propriete": None,
+            "ville": None,
+            "quartier": None,
+            "nb_logements": None,
+            "prix": None,
+        },
+        "revenus": {
+            "revenu_brut_potentiel_annuel": None
+        },
+        "depenses_vraies": {
+            "taxes_municipales": None,
+            "taxes_scolaires": None,
+            "assurances": None,
+            "autres_depenses_connues": None
+        },
+        "hypotheses": {
+            "vacance_pourcentage": None,
+            "entretien_annuel": None
+        },
+        "metrics": {
+            "noi_estime_annuel": None,
+            "cap_rate_estime": None,
+            "cashflow_mensuel_estime": None
+        }
+    }
 
-    taxes_mun = _to_num(depenses.get("taxes_municipales")) or 0.0
-    taxes_sco = _to_num(depenses.get("taxes_scolaires")) or 0.0
-    assurances = _to_num(depenses.get("assurances")) or 0.0
-    autres = _to_num(depenses.get("autres_depenses_connues")) or 0.0
-    entretien = _to_num(hypotheses.get("entretien_annuel")) or 0.0
+    # Prix
+    out["property_overview"]["prix"] = _find_value_near_labels(
+        text, ["Prix", "Prix demandé", "Price"]
+    )
 
-    vacance_pct = _to_num(hypotheses.get("vacance_pourcentage"))
-    if vacance_pct is None:
-        vacance_pct = 0.05  # par défaut 5 %
+    # Taxes municipales / scolaires
+    out["depenses_vraies"]["taxes_municipales"] = _find_value_near_labels(
+        text, ["Taxes municipales", "Taxe municipale", "Municipal taxes"]
+    )
 
-    if prix is not None and prix > 0 and revenu_brut is not None:
-        revenu_net_apres_vacance = revenu_brut * (1 - vacance_pct)
-        depenses_totales = taxes_mun + taxes_sco + assurances + autres + entretien
-        noi = revenu_net_apres_vacance - depenses_totales
+    out["depenses_vraies"]["taxes_scolaires"] = _find_value_near_labels(
+        text, ["Taxes scolaires", "Taxe scolaire", "School taxes"]
+    )
 
-        cap_rate = (noi / prix) * 100.0
-        mensualite_hypotheque = (prix * 0.06) / 12.0  # hypothèse simple
-        cashflow_mensuel = (noi / 12.0) - mensualite_hypotheque
+    # Revenu brut annuel
+    out["revenus"]["revenu_brut_potentiel_annuel"] = _find_value_near_labels(
+        text, ["Revenu brut", "Revenus bruts", "Gross income"]
+    )
 
-        metrics["noi_estime_annuel"] = round(noi, 2)
-        metrics["cap_rate_estime"] = round(cap_rate, 2)
-        metrics["cashflow_mensuel_estime"] = round(cashflow_mensuel, 2)
-    else:
-        metrics.setdefault("noi_estime_annuel", None)
-        metrics.setdefault("cap_rate_estime", None)
-        metrics.setdefault("cashflow_mensuel_estime", None)
+    # Nb logements
+    m = re.search(r"\b(\d+)\s+(logements|logement|unités|unites)\b", text, flags=re.IGNORECASE)
+    if m:
+        try:
+            out["property_overview"]["nb_logements"] = int(m.group(1))
+        except Exception:
+            pass
 
-    data["metrics"] = metrics
-    return data
-
-
-def analyser_centris(input_content: str) -> dict:
-    """
-    Point d'entrée : prend soit une URL, soit du HTML.
-    - Si ça commence par http : on télécharge la page (pour usage local).
-    - Sinon : on considère que c'est du HTML brut.
-    """
-
-    if input_content.strip().startswith("http"):
-        html = fetch_html(input_content.strip())
-    else:
-        html = input_content
-
-    cleaned = clean_html(html)
-    base = analyze_with_openai(cleaned)
-    enriched = enrich_results(base)
-    return enriched
+    return out
