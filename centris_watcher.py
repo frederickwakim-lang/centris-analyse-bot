@@ -8,13 +8,8 @@ import re
 import requests
 from bs4 import BeautifulSoup
 
-# ✅ Template 1
 from template1_calcs import Template1Inputs, compute_template1, format_discord_template1
 
-
-# ===========================
-# CONFIG
-# ===========================
 
 CENTRIS_SEARCH_URL = os.getenv(
     "CENTRIS_SEARCH_URL",
@@ -33,10 +28,6 @@ FULL_SCAN_INTERVAL_SECONDS = int(os.getenv("FULL_SCAN_INTERVAL_SECONDS", "300"))
 
 SEEN_FILE = "seen_listings.json"
 
-
-# ===========================
-# UTILITAIRES
-# ===========================
 
 def load_seen_ids():
     try:
@@ -57,7 +48,6 @@ def extract_listing_id(url: str):
 
 
 def fetch_html_from_url(url: str) -> str:
-    """Télécharge une page (Centris) avec headers plus réalistes."""
     headers = {
         "User-Agent": (
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -104,10 +94,6 @@ def get_listing_urls_from_search():
     return urls
 
 
-# ===========================
-# ANALYSE (HTML -> /analyze)
-# ===========================
-
 def analyze_listing(url: str):
     print(f"🧠 Analyse : {url}")
 
@@ -150,210 +136,7 @@ def analyze_listing(url: str):
     return data
 
 
-# ===========================
-# MAPPING -> TEMPLATE 1 (ANTI N/A)
-# ===========================
+# ========= MAPPING ROBUSTE =========
 
 def pick(d: dict, *paths, default=None):
-    """Essaie plusieurs chemins possibles dans le JSON (nested)."""
     def get_path(obj, path):
-        cur = obj
-        for k in path:
-            if not isinstance(cur, dict) or k not in cur:
-                return None
-            cur = cur[k]
-        return cur
-
-    for p in paths:
-        val = get_path(d, p)
-        if val not in (None, "", "N/A"):
-            return val
-    return default
-
-
-def build_template1_inputs(data: dict) -> Template1Inputs:
-    # DEBUG: ça va apparaître dans les logs Render
-    print("🔑 TOP LEVEL KEYS:", list(data.keys())[:30])
-
-    price = pick(
-        data,
-        ("price",), ("prix",),
-        ("property_overview", "price"), ("property_overview", "prix"),
-        ("property", "price"),
-    )
-
-    units = pick(
-        data,
-        ("units",), ("unites",),
-        ("property_overview", "units"), ("property_overview", "unites"),
-    )
-
-    revenu_brut_annuel = pick(
-        data,
-        ("gross_income_annual",),
-        ("revenu_brut_annuel",),
-        ("revenus", "revenu_brut_annuel"),
-        ("revenus", "revenu_brut_potentiel_annuel"),
-        ("financials", "gross_income"),
-    )
-
-    taxes_scolaires = pick(
-        data,
-        ("taxes_school",), ("taxes_scolaires",),
-        ("depenses_vraies", "taxes_scolaires"),
-        ("taxes", "school"),
-    )
-
-    taxes_municipales = pick(
-        data,
-        ("taxes_municipal",), ("taxes_municipales",),
-        ("depenses_vraies", "taxes_municipales"),
-        ("taxes", "municipal"),
-    )
-
-    assurances = pick(
-        data,
-        ("insurance_annual",), ("assurances",),
-        ("depenses_vraies", "assurances"),
-    )
-
-    services_publics = pick(
-        data,
-        ("utilities_annual",), ("services_publics",),
-        ("depenses_vraies", "services_publics"),
-    )
-
-    electricite = pick(
-        data,
-        ("electricity_annual",), ("electricite",),
-        ("depenses_vraies", "electricite"),
-    )
-
-    chauffage = pick(
-        data,
-        ("heating_annual",), ("chauffage",),
-        ("depenses_vraies", "chauffage"),
-    )
-
-    deneigement = pick(
-        data,
-        ("snow_annual",), ("deneigement",),
-        ("depenses_vraies", "deneigement"),
-    )
-
-    conciergerie = pick(
-        data,
-        ("concierge_annual",), ("conciergerie",),
-        ("depenses_vraies", "conciergerie"),
-        default=None,
-    )
-
-    return Template1Inputs(
-        price=price,
-        units=units,
-        revenu_brut_annuel=revenu_brut_annuel,
-        taxes_scolaires=taxes_scolaires,
-        taxes_municipales=taxes_municipales,
-        assurances=assurances,
-        services_publics=services_publics,
-        electricite=electricite,
-        chauffage=chauffage,
-        deneigement=deneigement,
-        conciergerie=conciergerie,
-    )
-
-
-# ===========================
-# DISCORD
-# ===========================
-
-def send_discord_message(data: dict, url: str):
-    if not DISCORD_WEBHOOK_URL:
-        print("⚠️ Aucun webhook Discord configuré.")
-        return
-
-    if isinstance(data, dict) and data.get("_error"):
-        content = f"⚠️ **Annonce détectée mais HTML bloqué/incomplet** (len={data.get('_html_len')})\n{url}"
-        resp = requests.post(DISCORD_WEBHOOK_URL, json={"content": content}, timeout=30)
-        print(f"  Discord status {resp.status_code}")
-        return
-
-    if not isinstance(data, dict):
-        content = f"⚠️ **Analyse échouée**\n{url}"
-        resp = requests.post(DISCORD_WEBHOOK_URL, json={"content": content}, timeout=30)
-        print(f"  Discord status {resp.status_code}")
-        return
-
-    inp = build_template1_inputs(data)
-    out = compute_template1(inp)
-    content = format_discord_template1(url, inp, out)
-
-    resp = requests.post(DISCORD_WEBHOOK_URL, json={"content": content}, timeout=30)
-    print(f"  Discord status {resp.status_code}")
-    if resp.status_code not in (200, 204):
-        print(f"  ⚠️ Réponse Discord : {resp.text[:300]}")
-
-
-# ===========================
-# UN CYCLE COMPLET DE SCAN
-# ===========================
-
-def run_one_full_scan():
-    seen = load_seen_ids()
-    print(f"📂 {len(seen)} annonces déjà analysées avant ce scan.\n")
-
-    urls = get_listing_urls_from_search()
-
-    for url in urls:
-        listing_id = extract_listing_id(url)
-
-        if not listing_id:
-            print(f"🔸 Pas d'ID : {url}")
-            continue
-
-        if listing_id in seen:
-            print(f"⏩ Déjà vue : {listing_id}")
-            continue
-
-        data = analyze_listing(url)
-
-        if not isinstance(data, dict):
-            print("❌ Erreur sur cette annonce, on passe à la suivante.\n")
-        else:
-            send_discord_message(data, url)
-            seen.add(listing_id)
-            save_seen_ids(seen)
-
-        print(f"⏳ Pause {REQUEST_INTERVAL_SECONDS} sec avant la prochaine annonce…\n")
-        try:
-            time.sleep(REQUEST_INTERVAL_SECONDS)
-        except KeyboardInterrupt:
-            print("⛔ Arrêt manuel pendant le scan.")
-            raise
-
-
-# ===========================
-# BOUCLE INFINIE POUR RENDER
-# ===========================
-
-def main_loop():
-    while True:
-        print("🚀 Nouveau scan complet Centris…")
-        try:
-            run_one_full_scan()
-        except KeyboardInterrupt:
-            print("⛔ Arrêt manuel demandé. On quitte proprement.")
-            break
-        except Exception as e:
-            print(f"💥 Erreur au niveau du cycle : {e}")
-
-        print(f"🕒 Pause {FULL_SCAN_INTERVAL_SECONDS} sec avant le prochain scan complet…\n")
-        try:
-            time.sleep(FULL_SCAN_INTERVAL_SECONDS)
-        except KeyboardInterrupt:
-            print("⛔ Arrêt manuel pendant la pause. On quitte.")
-            break
-
-
-if __name__ == "__main__":
-    main_loop()
