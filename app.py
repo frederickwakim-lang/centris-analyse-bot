@@ -111,4 +111,6 @@ def health():
 
 
 if __name__ == "__main__":
-    app.run(debug=True, port=int(os.getenv("PORT", "5000")))
+    # Render met le port dans la variable d'environnement PORT
+    port = int(os.getenv("PORT", "10000"))
+    app.run(host="0.0.0.0", port=port, debug=False)
