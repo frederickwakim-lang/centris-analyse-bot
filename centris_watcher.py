@@ -8,26 +8,29 @@ import re
 import requests
 from bs4 import BeautifulSoup
 
+# ✅ Template 1 (nouveau)
+from template1_calcs import Template1Inputs, compute_template1, format_discord_template1
+
+
 # ===========================
 # CONFIG
 # ===========================
 
 CENTRIS_SEARCH_URL = os.getenv(
     "CENTRIS_SEARCH_URL",
-    "https://www.centris.ca/fr/plex~a-vendre?uc=0",  # Tous les plex au Québec
+    "https://www.centris.ca/fr/plex~a-vendre?uc=0",
 )
 
-ANALYZER_URL = os.getenv(
-    "ANALYZER_URL",
-    "https://centris-analyse-bot.onrender.com/analyze",
-)
+# ⚠️ IMPORTANT: ici on met la base URL (sans /analyze),
+# puis on appelle /analyze nous-mêmes.
+ANALYZER_BASE_URL = os.getenv(
+    "ANALYZER_BASE_URL",
+    "https://centris-analyse-bot.onrender.com",
+).rstrip("/")
 
 DISCORD_WEBHOOK_URL = os.getenv("DISCORD_WEBHOOK_URL")
 
-# Pause entre deux appels GPT (pour respecter le rate limit)
 REQUEST_INTERVAL_SECONDS = int(os.getenv("REQUEST_INTERVAL_SECONDS", "40"))
-
-# Pause entre deux SCANS COMPLETS de la page Centris (ex : 5 min)
 FULL_SCAN_INTERVAL_SECONDS = int(os.getenv("FULL_SCAN_INTERVAL_SECONDS", "300"))
 
 SEEN_FILE = "seen_listings.json"
@@ -38,7 +41,6 @@ SEEN_FILE = "seen_listings.json"
 # ===========================
 
 def load_seen_ids():
-    """Charge la liste des IDs déjà analysés."""
     try:
         with open(SEEN_FILE, "r", encoding="utf-8") as f:
             return set(json.load(f))
@@ -47,19 +49,33 @@ def load_seen_ids():
 
 
 def save_seen_ids(ids_set):
-    """Sauvegarde la liste des IDs déjà analysés."""
     with open(SEEN_FILE, "w", encoding="utf-8") as f:
         json.dump(sorted(list(ids_set)), f, ensure_ascii=False, indent=2)
 
 
 def extract_listing_id(url: str):
-    """Extrait l'ID Centris (7–8 chiffres) depuis l'URL."""
     m = re.search(r"/(\d{7,8})(?:[^\d]|$)", url)
     return m.group(1) if m else None
 
 
+def fetch_html_from_url(url: str) -> str:
+    """Télécharge une page (Centris) avec headers plus réalistes."""
+    headers = {
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/121.0.0.0 Safari/537.36"
+        ),
+        "Accept-Language": "fr-CA,fr;q=0.9,en;q=0.8",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Connection": "keep-alive",
+    }
+    resp = requests.get(url, headers=headers, timeout=30)
+    resp.raise_for_status()
+    return resp.text
+
+
 def get_listing_urls_from_search():
-    """Récupère toutes les URLs de fiches plex sur la page de recherche."""
     print(f"🔎 Téléchargement : {CENTRIS_SEARCH_URL}")
     resp = requests.get(
         CENTRIS_SEARCH_URL,
@@ -74,11 +90,9 @@ def get_listing_urls_from_search():
     for a in soup.find_all("a", href=True):
         href = a["href"]
 
-        # On évite les versions anglaises et la vue Map
         if "plexes-for-sale" in href or "view=Map" in href:
             continue
 
-        # On garde seulement les fiches FR de type plex
         if not href.startswith("/fr/"):
             continue
         if not any(x in href for x in ["/duplex", "/triplex", "/quadruplex", "/plex"]):
@@ -92,13 +106,38 @@ def get_listing_urls_from_search():
     return urls
 
 
+# ===========================
+# ANALYSE (HTML -> /analyze)
+# ===========================
+
 def analyze_listing(url: str):
-    """Appelle ton API /analyze sur Render pour cette annonce."""
+    """
+    ✅ NOUVEAU FLOW (anti N/A):
+    1) Le watcher fetch le HTML complet
+    2) Il envoie {"content": html} à l’analyseur
+    3) L’analyseur parse et retourne un JSON
+    """
     print(f"🧠 Analyse : {url}")
+
+    try:
+        html = fetch_html_from_url(url)
+    except Exception as e:
+        print(f"  ❌ Erreur fetch HTML : {e}")
+        return None
+
+    # Debug / protection contre pages bloquées
+    html_len = len(html) if html else 0
+    print(f"  📄 HTML length = {html_len}")
+
+    # Si c’est trop petit, souvent c’est une page de blocage/placeholder
+    if not html or html_len < 50000:
+        print("  ⚠️ HTML suspect (trop petit). Probable blocage Centris.")
+        return {"_error": "HTML suspect / blocage Centris", "_html_len": html_len}
+
     try:
         resp = requests.post(
-            ANALYZER_URL,
-            json={"url": url},
+            f"{ANALYZER_BASE_URL}/analyze",
+            json={"content": html},
             headers={"Content-Type": "application/json"},
             timeout=120,
         )
@@ -108,8 +147,6 @@ def analyze_listing(url: str):
 
     if resp.status_code != 200:
         print(f"  ❌ Erreur HTTP {resp.status_code} : {resp.text[:300]}")
-        if "rate limit" in resp.text.lower():
-            print("  ⚠️ Rate limit détecté, on stoppe ce cycle proprement.")
         return None
 
     try:
@@ -124,90 +161,64 @@ def analyze_listing(url: str):
 
 
 # ===========================
-# CALCULS 100% BASÉS SUR LES VRAIS CHIFFRES
+# MAPPING -> TEMPLATE 1
 # ===========================
 
-def _as_number_or_zero(v):
-    """Retourne le nombre si c'en est un, sinon 0 (on ignore ce champ)."""
-    return v if isinstance(v, (int, float)) else 0.0
-
-
-def enrich_metrics_without_defaults(data: dict) -> dict:
+def build_template1_inputs(data: dict) -> Template1Inputs:
     """
-    Calcule NOI, cap rate et cashflow mensuel en utilisant
-    UNIQUEMENT les nombres déjà présents dans le JSON.
-
-    - On NE RAJOUTE PAS de montants inventés.
-    - Si une dépense est absente ou null -> on la traite comme 0 dans le calcul.
+    IMPORTANT:
+    Ici on mappe les clés de TON analyseur (data) vers Template1Inputs.
+    J’ai mis des clés probables + fallbacks.
+    Si tes clés diffèrent, on ajustera en 30 sec avec un exemple JSON.
     """
-
-    if not isinstance(data, dict):
-        return data
-
     po = data.get("property_overview") or {}
     rev = data.get("revenus") or {}
     dep = data.get("depenses_vraies") or {}
-    hyp = data.get("hypotheses") or {}
-    metrics = data.get("metrics") or {}
 
-    prix = po.get("prix")
-    revenu_brut = rev.get("revenu_brut_potentiel_annuel")
+    inp = Template1Inputs(
+        price=po.get("prix") or data.get("price"),
+        units=po.get("unites") or data.get("units"),
+        revenu_brut_annuel=rev.get("revenu_brut_potentiel_annuel") or data.get("gross_income_annual"),
 
-    # Si pas de prix ou pas de revenu -> pas de calcul possible
-    if not isinstance(prix, (int, float)) or not isinstance(revenu_brut, (int, float)) or prix <= 0:
-        data["metrics"] = metrics
-        return data
+        taxes_scolaires=dep.get("taxes_scolaires") or data.get("taxes_school"),
+        taxes_municipales=dep.get("taxes_municipales") or data.get("taxes_municipal"),
 
-    taxes_mun = _as_number_or_zero(dep.get("taxes_municipales"))
-    taxes_sco = _as_number_or_zero(dep.get("taxes_scolaires"))
-    assurances = _as_number_or_zero(dep.get("assurances"))
-    autres = _as_number_or_zero(dep.get("autres_depenses_connues"))
-
-    vacance = hyp.get("vacance_pourcentage")
-    vacance = vacance if isinstance(vacance, (int, float)) else 0.0
-    entretien = hyp.get("entretien_annuel")
-    entretien = entretien if isinstance(entretien, (int, float)) else 0.0
-
-    revenu_net = revenu_brut * (1 - vacance)
-    depenses_totales = taxes_mun + taxes_sco + assurances + autres + entretien
-
-    noi = revenu_net - depenses_totales
-    cap_rate = (noi / prix) * 100
-    cashflow_mensuel = noi / 12
-
-    metrics["noi_estime_annuel"] = round(noi, 2)
-    metrics["cap_rate_estime"] = round(cap_rate, 2)
-    metrics["cashflow_mensuel_estime"] = round(cashflow_mensuel, 2)
-
-    data["metrics"] = metrics
-    return data
+        assurances=dep.get("assurances") or data.get("insurance_annual"),
+        services_publics=dep.get("services_publics") or data.get("utilities_annual"),
+        electricite=dep.get("electricite") or data.get("electricity_annual"),
+        chauffage=dep.get("chauffage") or data.get("heating_annual"),
+        deneigement=dep.get("deneigement") or data.get("snow_annual"),
+        conciergerie=dep.get("conciergerie") or data.get("concierge_annual"),
+    )
+    return inp
 
 
-def _replace_none_for_display(obj):
-    """Pour Discord : remplace None par 'N/A' uniquement pour l'affichage."""
-    if isinstance(obj, dict):
-        return {k: _replace_none_for_display(v) for k, v in obj.items()}
-    if isinstance(obj, list):
-        return [_replace_none_for_display(x) for x in obj]
-    if obj is None:
-        return "N/A"
-    return obj
-
+# ===========================
+# DISCORD
+# ===========================
 
 def send_discord_message(data: dict, url: str):
-    """Enrichit avec les metrics puis envoie sur Discord."""
     if not DISCORD_WEBHOOK_URL:
         print("⚠️ Aucun webhook Discord configuré.")
         return
 
-    enriched = enrich_metrics_without_defaults(data)
-    display_data = _replace_none_for_display(enriched)
+    # Si on a un blocage Centris détecté
+    if isinstance(data, dict) and data.get("_error"):
+        content = f"⚠️ **Annonce détectée mais HTML bloqué/incomplet** (len={data.get('_html_len')})\n{url}"
+        resp = requests.post(DISCORD_WEBHOOK_URL, json={"content": content}, timeout=30)
+        print(f"  Discord status {resp.status_code}")
+        return
 
-    content = (
-        f"**Nouvelle annonce analysée !**\n"
-        f"{url}\n"
-        f"```json\n{json.dumps(display_data, indent=2, ensure_ascii=False)}\n```"
-    )
+    if not isinstance(data, dict):
+        content = f"⚠️ **Analyse échouée**\n{url}"
+        resp = requests.post(DISCORD_WEBHOOK_URL, json={"content": content}, timeout=30)
+        print(f"  Discord status {resp.status_code}")
+        return
+
+    # ✅ Template 1 calculations
+    inp = build_template1_inputs(data)
+    out = compute_template1(inp)
+    content = format_discord_template1(url, inp, out)
 
     resp = requests.post(
         DISCORD_WEBHOOK_URL,
@@ -224,7 +235,6 @@ def send_discord_message(data: dict, url: str):
 # ===========================
 
 def run_one_full_scan():
-    """Un scan complet : récupère la page, détecte les nouvelles annonces, les analyse, envoie sur Discord."""
     seen = load_seen_ids()
     print(f"📂 {len(seen)} annonces déjà analysées avant ce scan.\n")
 
@@ -263,7 +273,6 @@ def run_one_full_scan():
 # ===========================
 
 def main_loop():
-    """Boucle infinie : Render va lancer ce script et il tournera en continu."""
     while True:
         print("🚀 Nouveau scan complet Centris…")
         try:
