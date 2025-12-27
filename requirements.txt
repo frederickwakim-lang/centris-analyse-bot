@@ -1,6 +1,6 @@
 flask
 python-dotenv
-openai>=1.6.0,<2
+openai>=1.6.0
 requests
 beautifulsoup4
 apscheduler
