@@ -164,33 +164,130 @@ def analyze_listing(url: str):
 # MAPPING -> TEMPLATE 1
 # ===========================
 
+def pick(d: dict, *paths, default=None):
+    """
+    Essaie plusieurs chemins possibles dans le JSON.
+    """
+    def get_path(obj, path):
+        cur = obj
+        for k in path:
+            if not isinstance(cur, dict) or k not in cur:
+                return None
+            cur = cur[k]
+        return cur
+
+    for p in paths:
+        val = get_path(d, p)
+        if val not in (None, "", "N/A"):
+            return val
+    return default
+
+
 def build_template1_inputs(data: dict) -> Template1Inputs:
-    """
-    IMPORTANT:
-    Ici on mappe les clés de TON analyseur (data) vers Template1Inputs.
-    J’ai mis des clés probables + fallbacks.
-    Si tes clés diffèrent, on ajustera en 30 sec avec un exemple JSON.
-    """
-    po = data.get("property_overview") or {}
-    rev = data.get("revenus") or {}
-    dep = data.get("depenses_vraies") or {}
+    # --- DEBUG VISUEL (IMPORTANT) ---
+    print("🔑 TOP LEVEL KEYS:", list(data.keys())[:30])
 
-    inp = Template1Inputs(
-        price=po.get("prix") or data.get("price"),
-        units=po.get("unites") or data.get("units"),
-        revenu_brut_annuel=rev.get("revenu_brut_potentiel_annuel") or data.get("gross_income_annual"),
-
-        taxes_scolaires=dep.get("taxes_scolaires") or data.get("taxes_school"),
-        taxes_municipales=dep.get("taxes_municipales") or data.get("taxes_municipal"),
-
-        assurances=dep.get("assurances") or data.get("insurance_annual"),
-        services_publics=dep.get("services_publics") or data.get("utilities_annual"),
-        electricite=dep.get("electricite") or data.get("electricity_annual"),
-        chauffage=dep.get("chauffage") or data.get("heating_annual"),
-        deneigement=dep.get("deneigement") or data.get("snow_annual"),
-        conciergerie=dep.get("conciergerie") or data.get("concierge_annual"),
+    # --- PROPERTY OVERVIEW ---
+    price = pick(
+        data,
+        ("price",),
+        ("prix",),
+        ("property_overview", "price"),
+        ("property_overview", "prix"),
+        ("property", "price"),
     )
-    return inp
+
+    units = pick(
+        data,
+        ("units",),
+        ("unites",),
+        ("property_overview", "units"),
+        ("property_overview", "unites"),
+    )
+
+    revenu_brut_annuel = pick(
+        data,
+        ("gross_income_annual",),
+        ("revenu_brut_annuel",),
+        ("revenus", "revenu_brut_annuel"),
+        ("revenus", "revenu_brut_potentiel_annuel"),
+        ("financials", "gross_income"),
+    )
+
+    # --- TAXES ---
+    taxes_scolaires = pick(
+        data,
+        ("taxes_school",),
+        ("taxes_scolaires",),
+        ("depenses_vraies", "taxes_scolaires"),
+        ("taxes", "school"),
+    )
+
+    taxes_municipales = pick(
+        data,
+        ("taxes_municipal",),
+        ("taxes_municipales",),
+        ("depenses_vraies", "taxes_municipales"),
+        ("taxes", "municipal"),
+    )
+
+    # --- DÉPENSES ---
+    assurances = pick(
+        data,
+        ("insurance_annual",),
+        ("assurances",),
+        ("depenses_vraies", "assurances"),
+    )
+
+    services_publics = pick(
+        data,
+        ("utilities_annual",),
+        ("services_publics",),
+        ("depenses_vraies", "services_publics"),
+    )
+
+    electricite = pick(
+        data,
+        ("electricity_annual",),
+        ("electricite",),
+        ("depenses_vraies", "electricite"),
+    )
+
+    chauffage = pick(
+        data,
+        ("heating_annual",),
+        ("chauffage",),
+        ("depenses_vraies", "chauffage"),
+    )
+
+    deneigement = pick(
+        data,
+        ("snow_annual",),
+        ("deneigement",),
+        ("depenses_vraies", "deneigement"),
+    )
+
+    conciergerie = pick(
+        data,
+        ("concierge_annual",),
+        ("conciergerie",),
+        ("depenses_vraies", "conciergerie"),
+        default=None,
+    )
+
+    return Template1Inputs(
+        price=price,
+        units=units,
+        revenu_brut_annuel=revenu_brut_annuel,
+        taxes_scolaires=taxes_scolaires,
+        taxes_municipales=taxes_municipales,
+        assurances=assurances,
+        services_publics=services_publics,
+        electricite=electricite,
+        chauffage=chauffage,
+        deneigement=deneigement,
+        conciergerie=conciergerie,
+    )
 
 
 # ===========================
