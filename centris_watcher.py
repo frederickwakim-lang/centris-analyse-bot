@@ -8,7 +8,7 @@ import re
 import requests
 from bs4 import BeautifulSoup
 
-# ✅ Template 1 (nouveau)
+# ✅ Template 1
 from template1_calcs import Template1Inputs, compute_template1, format_discord_template1
 
 
@@ -21,8 +21,6 @@ CENTRIS_SEARCH_URL = os.getenv(
     "https://www.centris.ca/fr/plex~a-vendre?uc=0",
 )
 
-# ⚠️ IMPORTANT: ici on met la base URL (sans /analyze),
-# puis on appelle /analyze nous-mêmes.
 ANALYZER_BASE_URL = os.getenv(
     "ANALYZER_BASE_URL",
     "https://centris-analyse-bot.onrender.com",
@@ -111,12 +109,6 @@ def get_listing_urls_from_search():
 # ===========================
 
 def analyze_listing(url: str):
-    """
-    ✅ NOUVEAU FLOW (anti N/A):
-    1) Le watcher fetch le HTML complet
-    2) Il envoie {"content": html} à l’analyseur
-    3) L’analyseur parse et retourne un JSON
-    """
     print(f"🧠 Analyse : {url}")
 
     try:
@@ -125,11 +117,9 @@ def analyze_listing(url: str):
         print(f"  ❌ Erreur fetch HTML : {e}")
         return None
 
-    # Debug / protection contre pages bloquées
     html_len = len(html) if html else 0
     print(f"  📄 HTML length = {html_len}")
 
-    # Si c’est trop petit, souvent c’est une page de blocage/placeholder
     if not html or html_len < 50000:
         print("  ⚠️ HTML suspect (trop petit). Probable blocage Centris.")
         return {"_error": "HTML suspect / blocage Centris", "_html_len": html_len}
@@ -161,13 +151,11 @@ def analyze_listing(url: str):
 
 
 # ===========================
-# MAPPING -> TEMPLATE 1
+# MAPPING -> TEMPLATE 1 (ANTI N/A)
 # ===========================
 
 def pick(d: dict, *paths, default=None):
-    """
-    Essaie plusieurs chemins possibles dans le JSON.
-    """
+    """Essaie plusieurs chemins possibles dans le JSON (nested)."""
     def get_path(obj, path):
         cur = obj
         for k in path:
@@ -184,25 +172,20 @@ def pick(d: dict, *paths, default=None):
 
 
 def build_template1_inputs(data: dict) -> Template1Inputs:
-    # --- DEBUG VISUEL (IMPORTANT) ---
+    # DEBUG: ça va apparaître dans les logs Render
     print("🔑 TOP LEVEL KEYS:", list(data.keys())[:30])
 
-    # --- PROPERTY OVERVIEW ---
     price = pick(
         data,
-        ("price",),
-        ("prix",),
-        ("property_overview", "price"),
-        ("property_overview", "prix"),
+        ("price",), ("prix",),
+        ("property_overview", "price"), ("property_overview", "prix"),
         ("property", "price"),
     )
 
     units = pick(
         data,
-        ("units",),
-        ("unites",),
-        ("property_overview", "units"),
-        ("property_overview", "unites"),
+        ("units",), ("unites",),
+        ("property_overview", "units"), ("property_overview", "unites"),
     )
 
     revenu_brut_annuel = pick(
@@ -214,63 +197,53 @@ def build_template1_inputs(data: dict) -> Template1Inputs:
         ("financials", "gross_income"),
     )
 
-    # --- TAXES ---
     taxes_scolaires = pick(
         data,
-        ("taxes_school",),
-        ("taxes_scolaires",),
+        ("taxes_school",), ("taxes_scolaires",),
         ("depenses_vraies", "taxes_scolaires"),
         ("taxes", "school"),
     )
 
     taxes_municipales = pick(
         data,
-        ("taxes_municipal",),
-        ("taxes_municipales",),
+        ("taxes_municipal",), ("taxes_municipales",),
         ("depenses_vraies", "taxes_municipales"),
         ("taxes", "municipal"),
     )
 
-    # --- DÉPENSES ---
     assurances = pick(
         data,
-        ("insurance_annual",),
-        ("assurances",),
+        ("insurance_annual",), ("assurances",),
         ("depenses_vraies", "assurances"),
     )
 
     services_publics = pick(
         data,
-        ("utilities_annual",),
-        ("services_publics",),
+        ("utilities_annual",), ("services_publics",),
         ("depenses_vraies", "services_publics"),
     )
 
     electricite = pick(
         data,
-        ("electricity_annual",),
-        ("electricite",),
+        ("electricity_annual",), ("electricite",),
         ("depenses_vraies", "electricite"),
     )
 
     chauffage = pick(
         data,
-        ("heating_annual",),
-        ("chauffage",),
+        ("heating_annual",), ("chauffage",),
         ("depenses_vraies", "chauffage"),
     )
 
     deneigement = pick(
         data,
-        ("snow_annual",),
-        ("deneigement",),
+        ("snow_annual",), ("deneigement",),
         ("depenses_vraies", "deneigement"),
     )
 
     conciergerie = pick(
         data,
-        ("concierge_annual",),
-        ("conciergerie",),
+        ("concierge_annual",), ("conciergerie",),
         ("depenses_vraies", "conciergerie"),
         default=None,
     )
@@ -299,7 +272,6 @@ def send_discord_message(data: dict, url: str):
         print("⚠️ Aucun webhook Discord configuré.")
         return
 
-    # Si on a un blocage Centris détecté
     if isinstance(data, dict) and data.get("_error"):
         content = f"⚠️ **Annonce détectée mais HTML bloqué/incomplet** (len={data.get('_html_len')})\n{url}"
         resp = requests.post(DISCORD_WEBHOOK_URL, json={"content": content}, timeout=30)
@@ -312,16 +284,11 @@ def send_discord_message(data: dict, url: str):
         print(f"  Discord status {resp.status_code}")
         return
 
-    # ✅ Template 1 calculations
     inp = build_template1_inputs(data)
     out = compute_template1(inp)
     content = format_discord_template1(url, inp, out)
 
-    resp = requests.post(
-        DISCORD_WEBHOOK_URL,
-        json={"content": content},
-        timeout=30,
-    )
+    resp = requests.post(DISCORD_WEBHOOK_URL, json={"content": content}, timeout=30)
     print(f"  Discord status {resp.status_code}")
     if resp.status_code not in (200, 204):
         print(f"  ⚠️ Réponse Discord : {resp.text[:300]}")
