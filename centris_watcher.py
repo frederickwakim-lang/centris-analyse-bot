@@ -63,7 +63,7 @@ def fetch_html_from_url(url: str) -> str:
         "Pragma": "no-cache",
         "Upgrade-Insecure-Requests": "1",
     }
-    resp = requests.get(url, headers=headers, timeout=FETCH_TIMEOUT_SECONDS)
+    resp = requests.get(url, headers=headers, timeout=FETCH_TIMEOUT_SECONDS, allow_redirects=True)
     resp.raise_for_status()
     return resp.text
 
@@ -106,6 +106,66 @@ def pick(d: dict, *paths, default=None):
             return cur
     return default
 
+
+# =========================
+# HTML VALIDATION (CRUCIAL)
+# =========================
+
+def looks_blocked(html: str) -> bool:
+    """
+    Détecte les pages qui ne sont pas la fiche (consent/captcha/challenge/blocked).
+    """
+    if not html:
+        return True
+    h = html.lower()
+
+    bad_markers = [
+        "captcha",
+        "access denied",
+        "forbidden",
+        "cloudflare",
+        "attention required",
+        "verify you are human",
+        "robot",
+        "challenge",
+        "enable javascript",
+        "cookies",
+        "cookie consent",
+        "consentement",
+        "politique de confidentialité",
+        "privacy policy",
+        "terms of service",
+        "incident id",
+        "request blocked",
+    ]
+    return any(x in h for x in bad_markers)
+
+
+def looks_like_listing(html: str, listing_id: str) -> bool:
+    """
+    Validation "c'est bien la fiche de CET id".
+    On veut voir l'id dans le HTML (souvent dans un JSON/script).
+    """
+    if not html or not listing_id:
+        return False
+
+    if "centris" not in html.lower():
+        return False
+
+    # Cherche l'ID brut
+    if listing_id in html:
+        return True
+
+    # Parfois l'ID apparaît comme "ListingId":12345678 etc.
+    if re.search(rf"(?i)(listing|property).*{re.escape(listing_id)}", html):
+        return True
+
+    return False
+
+
+# =========================
+# Analyzer POST
+# =========================
 
 def _post_to_analyzer(payload: dict):
     """
@@ -162,10 +222,12 @@ def analyze_listing(url: str):
     """
     ✅ STRICT MODE:
     - Copie-colle le HTML complet de Centris
-    - Envoie TOUJOURS {"url": url, "content": html} à l'analyseur
-    - Aucune invention
+    - Valide que c'est la vraie fiche (sinon stop)
+    - Envoie {"url": url, "content": html} à l'analyseur
     """
     print(f"🧠 Analyse : {url}", flush=True)
+
+    listing_id = extract_listing_id(url)
 
     # 1) fetch HTML complet
     try:
@@ -177,7 +239,31 @@ def analyze_listing(url: str):
     html_len = len(html) if html else 0
     print(f"  📄 HTML length = {html_len}", flush=True)
 
-    # 2) POST à l'analyseur avec la clé attendue: content
+    blocked = looks_blocked(html)
+    is_listing = looks_like_listing(html, listing_id) if listing_id else False
+    print(f"  DEBUG listing_id={listing_id} blocked={blocked} looks_like_listing={is_listing}", flush=True)
+
+    # 2) si HTML pas la fiche => on stop, pas d'invention
+    if blocked:
+        return {
+            "_error": "html_blocked_or_consent",
+            "_message": "HTML semble être une page de blocage/consent/captcha (pas la fiche Centris).",
+            "_html_len": html_len,
+            "_url": url,
+            "_listing_id": listing_id,
+        }
+
+    # si pas certain que c'est la bonne fiche
+    if listing_id and not is_listing:
+        return {
+            "_error": "html_not_listing_page",
+            "_message": "HTML ne contient pas l'ID de l'annonce -> probablement pas la fiche complète.",
+            "_html_len": html_len,
+            "_url": url,
+            "_listing_id": listing_id,
+        }
+
+    # 3) POST à l'analyseur avec la clé attendue: content
     payload = {"url": url, "content": html}
     status, body_or_text, data = _post_to_analyzer(payload)
 
@@ -185,6 +271,8 @@ def analyze_listing(url: str):
     if isinstance(data, dict) and data.get("_error"):
         print(f"  ❌ Analyzer network error: {data.get('_message')}", flush=True)
         data["_html_len"] = html_len
+        data["_url"] = url
+        data["_listing_id"] = listing_id
         return data
 
     # HTTP non-200 ou JSON invalide
@@ -196,7 +284,8 @@ def analyze_listing(url: str):
             "_body": body_or_text,
             "_message": None,
             "_html_len": html_len,
-            "_url": url
+            "_url": url,
+            "_listing_id": listing_id,
         }
 
     print("  ✅ Analyse OK", flush=True)
@@ -229,7 +318,7 @@ def send_discord_message(data: dict, url: str):
     if not DISCORD_WEBHOOK_URL:
         return
 
-    # Si erreur fetch/analyzer -> warning
+    # Si erreur fetch/analyzer/html -> warning
     if isinstance(data, dict) and data.get("_error"):
         content = (
             f"{WATCHER_TAG}\n"
@@ -239,6 +328,7 @@ def send_discord_message(data: dict, url: str):
             f"• body: {data.get('_body')}\n"
             f"• message: {data.get('_message')}\n"
             f"• html_len: {data.get('_html_len')}\n"
+            f"• listing_id: {data.get('_listing_id')}\n"
             f"{url}"
         )
         requests.post(DISCORD_WEBHOOK_URL, json={"content": content}, timeout=30)
@@ -256,7 +346,7 @@ def send_discord_message(data: dict, url: str):
         requests.post(DISCORD_WEBHOOK_URL, json={"content": content}, timeout=30)
         return
 
-    # Sinon -> Template 1 normal
+    # Sinon -> Template 1 normal (si l'analyzer n'a pas les champs, ça restera N/A, mais pas inventé)
     inp = build_template1_inputs(data)
     out = compute_template1(inp)
     content = format_discord_template1(url, inp, out)
@@ -304,4 +394,5 @@ if __name__ == "__main__":
             print("[WATCHER] ERROR — restart in 60s", flush=True)
             traceback.print_exc()
             time.sleep(60)
+
 

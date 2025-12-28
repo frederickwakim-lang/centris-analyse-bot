@@ -80,29 +80,75 @@ def index():
 @app.route("/analyze", methods=["POST"])
 def api_analyze():
     """
-    Endpoint API pour ton watcher ou des scripts.
-    JSON d'entrée :
-      - soit {"url": "https://..."}
-      - soit {"content": "<html>...</html>"}
+    Endpoint API pour watcher/scripts.
+
+    JSON d'entrée accepté:
+      - {"url": "https://..."}
+      - {"content": "<html>...</html>"}
+      - {"html": "<html>...</html>"}   ✅ (compat watcher)
     """
     body = request.get_json(silent=True) or {}
 
     url = body.get("url")
     content = body.get("content")
+    html_direct = body.get("html")  # ✅ compat
 
-    if not url and not content:
-        return jsonify({"error": "Il faut fournir 'url' ou 'content'."}), 400
+    # choisir la source
+    html = None
+    source = None
+
+    if url:
+        source = "url"
+        try:
+            html = fetch_html_from_url(url)
+        except Exception as e:
+            return jsonify({
+                "error": "fetch_failed",
+                "source": "url",
+                "message": str(e),
+                "url": url,
+            }), 502
+
+    elif html_direct:
+        source = "html"
+        html = html_direct
+
+    elif content:
+        source = "content"
+        html = content
+
+    else:
+        return jsonify({"error": "missing_input", "message": "Il faut fournir 'url' ou 'content' ou 'html'."}), 400
+
+    # 🔒 garde-fou: HTML trop court = pas une vraie page Centris
+    if not html or len(html) < 2000:
+        return jsonify({
+            "error": "missing_or_too_short_html",
+            "source": source,
+            "len": len(html) if html else 0,
+        }), 400
 
     try:
-        if url:
-            html = fetch_html_from_url(url)
-        else:
-            html = content
-
         data = analyser_centris(html)
-        return jsonify(data)
+
+        # 🔒 toujours retourner ces clés
+        if isinstance(data, dict):
+            data.setdefault("__analyzer_version__", "UNKNOWN")
+            data.setdefault("raw_debug", {})
+            data.setdefault("_api_debug", {})
+            data["_api_debug"].update({
+                "source": source,
+                "html_len": len(html),
+            })
+
+        return jsonify(data), 200
+
     except Exception as e:
-        return jsonify({"error": f"Erreur calculs/analyse: {e}"}), 500
+        return jsonify({
+            "error": "analyzer_exception",
+            "message": str(e),
+            "source": source,
+        }), 500
 
 
 @app.route("/health", methods=["GET"])
@@ -111,6 +157,5 @@ def health():
 
 
 if __name__ == "__main__":
-    # Render met le port dans la variable d'environnement PORT
     port = int(os.getenv("PORT", "10000"))
     app.run(host="0.0.0.0", port=port, debug=False)
