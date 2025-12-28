@@ -5,8 +5,8 @@ from typing import Optional, Dict, Any
 
 # Constantes Template 1 (selon ton sheet)
 QF_DEFAULT = 0.80          # QF 80%
-RATE_DEFAULT = 0.035       # Taux 3,50%
-AMORT_YEARS_DEFAULT = 20   # Amort 20
+RATE_DEFAULT = 0.04        # ✅ Taux 4.00%
+AMORT_YEARS_DEFAULT = 40   # ✅ Amort 40
 DSCR_TARGET_DEFAULT = 1.10 # DSCR 1,1
 
 VACANCY_RATE_DEFAULT = 0.03   # Vacances 3%
@@ -48,6 +48,8 @@ def safe_div(a: Optional[float], b: Optional[float]) -> Optional[float]:
 def pmt_monthly(principal: float, annual_rate: float, years: int, payments_per_year: int = 12) -> float:
     r = annual_rate / payments_per_year
     n = years * payments_per_year
+    if n <= 0:
+        return 0.0
     if r == 0:
         return principal / n
     return principal * (r * (1 + r) ** n) / ((1 + r) ** n - 1)
@@ -128,7 +130,6 @@ def compute_template1(inp: Template1Inputs) -> Dict[str, Any]:
     entretien = inp.entretien_fixed
 
     depenses_fausses = nz(vacances) + nz(salaires) + nz(entretien)
-
     depenses_totales = depenses_vraies + depenses_fausses
 
     noi = None
@@ -164,18 +165,14 @@ def compute_template1(inp: Template1Inputs) -> Dict[str, Any]:
     if noi is not None and inp.cap_target_offer and inp.cap_target_offer > 0:
         offre_max = noi / inp.cap_target_offer
 
-    # Valeur (souvent même logique que offre_max, selon tes usages)
     valeur = offre_max
 
-    # $ refinancé (approx): (valeur * QF) - (loan actuel)
     refinance_cash = None
     if valeur is not None and price is not None:
         refinance_cash = (valeur * inp.qf) - (price * inp.qf)
 
-    # Ratios
     noi_pct = safe_div(noi, gross)
 
-    # $/unit et $/sqft restent à calculer si tu les as déjà (units, sqft)
     out = {
         "price": price,
         "units": inp.units,
@@ -214,6 +211,7 @@ def compute_template1(inp: Template1Inputs) -> Dict[str, Any]:
 
 def format_discord_template1(url: str, inp: Template1Inputs, out: Dict[str, Any]) -> str:
     lines = []
+    lines.append("[CALCS v2025-12-28]")  # ✅ TAG
     lines.append("**🏢 Nouvelle annonce (Template 1)**")
     lines.append(url)
 
@@ -237,8 +235,8 @@ def format_discord_template1(url: str, inp: Template1Inputs, out: Dict[str, Any]
     lines.append(f"• QF: {pct(out.get('qf'))}")
     lines.append(f"• Loan: {money(out.get('loan'))}")
     lines.append(f"• Down: {money(out.get('down_payment'))}")
-    lines.append(f"• Taux: {pct(out.get('taux'))}")
-    lines.append(f"• Amort: {out.get('amort_years') if out.get('amort_years') is not None else 'N/A'}")
+    lines.append(f"• Taux: {pct(out.get('taux'))}")  # ✅ affichera 4.00%
+    lines.append(f"• Amort: {out.get('amort_years') if out.get('amort_years') is not None else 'N/A'}")  # ✅ 40
     lines.append(f"• PMT: {money(out.get('pmt_monthly'))}")
     lines.append(f"• DSCR: {out.get('dscr') if out.get('dscr') is not None else 'N/A'}")
     lines.append(f"• NOI Required (DSCR {inp.dscr_target}): {money(out.get('noi_required'))}")
