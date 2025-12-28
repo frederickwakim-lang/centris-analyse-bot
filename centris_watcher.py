@@ -21,6 +21,11 @@ FULL_SCAN_INTERVAL_SECONDS = int(os.getenv("FULL_SCAN_INTERVAL_SECONDS", "300"))
 SEEN_FILE = "seen_listings.json"
 WATCHER_TAG = "[WATCHER v2025-12-28]"
 
+# Robust timeouts/retries
+ANALYZER_TIMEOUT_SECONDS = int(os.getenv("ANALYZER_TIMEOUT_SECONDS", "120"))
+ANALYZER_RETRY = int(os.getenv("ANALYZER_RETRY", "2"))
+FETCH_TIMEOUT_SECONDS = int(os.getenv("FETCH_TIMEOUT_SECONDS", "30"))
+
 
 def load_seen_ids():
     try:
@@ -53,14 +58,14 @@ def fetch_html_from_url(url: str) -> str:
         "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
         "Connection": "keep-alive",
     }
-    resp = requests.get(url, headers=headers, timeout=30)
+    resp = requests.get(url, headers=headers, timeout=FETCH_TIMEOUT_SECONDS)
     resp.raise_for_status()
     return resp.text
 
 
 def get_listing_urls_from_search():
     print(f"🔎 Téléchargement : {CENTRIS_SEARCH_URL}", flush=True)
-    resp = requests.get(CENTRIS_SEARCH_URL, headers={"User-Agent": "Mozilla/5.0"}, timeout=30)
+    resp = requests.get(CENTRIS_SEARCH_URL, headers={"User-Agent": "Mozilla/5.0"}, timeout=FETCH_TIMEOUT_SECONDS)
     resp.raise_for_status()
 
     soup = BeautifulSoup(resp.text, "html.parser")
@@ -131,9 +136,73 @@ def _analysis_debug_line(data: dict) -> str:
     return f"ver={ver} api={api_dbg} raw_debug={raw}"
 
 
+def _post_to_analyzer(payload: dict):
+    """
+    POST helper avec retries (timeout/5xx/429).
+    Retourne (status_code, text, json_or_none).
+    """
+    url = f"{ANALYZER_BASE_URL}/analyze"
+    headers = {"Content-Type": "application/json"}
+
+    last_exc = None
+    for attempt in range(ANALYZER_RETRY + 1):
+        try:
+            resp = requests.post(url, json=payload, headers=headers, timeout=ANALYZER_TIMEOUT_SECONDS)
+
+            # OK
+            if resp.status_code == 200:
+                try:
+                    return resp.status_code, resp.text, resp.json()
+                except Exception:
+                    return resp.status_code, resp.text, None
+
+            # Retry on these
+            if resp.status_code in (429, 500, 502, 503, 504):
+                if attempt < ANALYZER_RETRY:
+                    time.sleep(1.2 * (attempt + 1))
+                    continue
+                # fallthrough return
+            # no-retry by default
+            try:
+                j = resp.json()
+                body_preview = json.dumps(j, ensure_ascii=False)[:600]
+            except Exception:
+                body_preview = resp.text[:600]
+            return resp.status_code, body_preview, None
+
+        except requests.exceptions.Timeout as e:
+            last_exc = e
+            if attempt < ANALYZER_RETRY:
+                time.sleep(1.2 * (attempt + 1))
+                continue
+            return None, None, {"_error": "analyzer_network_error", "_message": f"timeout: {e}"}
+        except Exception as e:
+            last_exc = e
+            return None, None, {"_error": "analyzer_network_error", "_message": str(e)}
+
+    return None, None, {"_error": "analyzer_network_error", "_message": str(last_exc) if last_exc else "unknown"}
+
+
 def analyze_listing(url: str):
     print(f"🧠 Analyse : {url}", flush=True)
 
+    # ✅ TRY #1: laisser l'analyzer fetch lui-même (le plus fiable si ton analyzer sait bypass/headers)
+    status, body_or_text, data = _post_to_analyzer({"url": url})
+
+    # Si _post_to_analyzer a déjà renvoyé un dict d'erreur
+    if isinstance(data, dict) and data.get("_error"):
+        print(f"  ❌ Erreur réseau vers analyseur : {data.get('_message')}", flush=True)
+        return data
+
+    if status == 200 and isinstance(data, dict):
+        print("  ✅ Analyse OK (via url)", flush=True)
+        return data
+
+    # Si 400 "il faut fournir url ou content" -> ça ne devrait plus arriver, mais on gère quand même.
+    if status is not None and status != 200:
+        print(f"  ⚠️ Analyzer HTTP {status} via url : {body_or_text}", flush=True)
+
+    # ✅ FALLBACK: fetch HTML ici, puis envoyer content (clé attendue par l'analyzer)
     try:
         html = fetch_html_from_url(url)
     except Exception as e:
@@ -143,47 +212,32 @@ def analyze_listing(url: str):
     html_len = len(html) if html else 0
     print(f"  📄 HTML length = {html_len}", flush=True)
 
-    # ⚠️ Ancien seuil 50k trop agressif → on baisse.
+    # ⚠️ Seuil anti-blocage (petit HTML = souvent page challenge/redirect)
     if not html or html_len < 8000:
         print("  ⚠️ HTML suspect (trop petit). Probable blocage Centris.", flush=True)
         return {"_error": "html_too_short", "_html_len": html_len}
 
-    try:
-        resp = requests.post(
-            f"{ANALYZER_BASE_URL}/analyze",
-            json={"html": html},
-            headers={"Content-Type": "application/json"},
-            timeout=120,
-        )
-    except Exception as e:
-        print(f"  ❌ Erreur réseau vers analyseur : {e}", flush=True)
-        return {"_error": "analyzer_network_error", "_message": str(e)}
+    # Envoi correct: content + url
+    status2, body2, data2 = _post_to_analyzer({"url": url, "content": html})
 
-    if resp.status_code != 200:
-        # ✅ IMPORTANT: on tente de lire le body JSON (pour voir le vrai message)
-        body_preview = resp.text[:600]
-        try:
-            j = resp.json()
-            body_preview = json.dumps(j, ensure_ascii=False)[:600]
-        except Exception:
-            pass
+    if isinstance(data2, dict) and data2.get("_error"):
+        return data2
 
-        print(f"  ❌ Erreur HTTP {resp.status_code} : {body_preview}", flush=True)
+    if status2 != 200:
+        print(f"  ❌ Erreur HTTP {status2} : {body2}", flush=True)
         return {
             "_error": "analyzer_http_error",
-            "_status": resp.status_code,
-            "_body": body_preview
+            "_status": status2,
+            "_body": body2,
+            "_html_len": html_len
         }
 
-    try:
-        data = resp.json()
-    except Exception:
+    if not isinstance(data2, dict):
         print("  ❌ Réponse non JSON :", flush=True)
-        print(resp.text[:500], flush=True)
-        return {"_error": "analyzer_non_json", "_body": resp.text[:600]}
+        return {"_error": "analyzer_non_json", "_body": (body2[:600] if isinstance(body2, str) else str(body2))}
 
-    print("  ✅ Analyse OK", flush=True)
-    return data
+    print("  ✅ Analyse OK (via content)", flush=True)
+    return data2
 
 
 def build_template1_inputs(data: dict) -> Template1Inputs:
@@ -298,3 +352,4 @@ if __name__ == "__main__":
             print("[WATCHER] ERROR — restart in 60s", flush=True)
             traceback.print_exc()
             time.sleep(60)
+
