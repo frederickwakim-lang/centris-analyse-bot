@@ -108,59 +108,70 @@ def pick(d: dict, *paths, default=None):
 
 
 # =========================
-# HTML VALIDATION (CRUCIAL)
+# HTML VALIDATION (FIXED)
 # =========================
-
-def looks_blocked(html: str) -> bool:
-    """
-    Détecte les pages qui ne sont pas la fiche (consent/captcha/challenge/blocked).
-    """
-    if not html:
-        return True
-    h = html.lower()
-
-    bad_markers = [
-        "captcha",
-        "access denied",
-        "forbidden",
-        "cloudflare",
-        "attention required",
-        "verify you are human",
-        "robot",
-        "challenge",
-        "enable javascript",
-        "cookies",
-        "cookie consent",
-        "consentement",
-        "politique de confidentialité",
-        "privacy policy",
-        "terms of service",
-        "incident id",
-        "request blocked",
-    ]
-    return any(x in h for x in bad_markers)
-
 
 def looks_like_listing(html: str, listing_id: str) -> bool:
     """
-    Validation "c'est bien la fiche de CET id".
-    On veut voir l'id dans le HTML (souvent dans un JSON/script).
+    Détermine si le HTML ressemble VRAIMENT à une fiche Centris.
+    Signaux forts:
+      - présence de __NEXT_DATA__ (Next.js)
+      - présence de l'ID de l'annonce dans le HTML
+      - présence de meta og:url / canonical contenant centris + l'id
     """
-    if not html or not listing_id:
+    if not html:
         return False
 
-    if "centris" not in html.lower():
+    hlow = html.lower()
+
+    if "centris" not in hlow:
         return False
 
-    # Cherche l'ID brut
-    if listing_id in html:
+    # Next.js data (très fréquent sur les fiches)
+    if 'id="__next_data__"' in hlow or "id='__next_data__'" in hlow:
         return True
 
-    # Parfois l'ID apparaît comme "ListingId":12345678 etc.
-    if re.search(rf"(?i)(listing|property).*{re.escape(listing_id)}", html):
+    if listing_id and listing_id in html:
         return True
+
+    # og:url / canonical
+    if listing_id:
+        if re.search(r'property="og:url"[^>]*content="[^"]*centris[^"]*' + re.escape(listing_id) + r'[^"]*"', html, re.IGNORECASE):
+            return True
+        if re.search(r'rel="canonical"[^>]*href="[^"]*centris[^"]*' + re.escape(listing_id) + r'[^"]*"', html, re.IGNORECASE):
+            return True
 
     return False
+
+
+def looks_hard_blocked(html: str) -> bool:
+    """
+    Détecte uniquement les VRAIS blocages/challenges.
+    IMPORTANT: on ne bloque plus pour "cookies/consent" (présent sur pages normales).
+    """
+    if not html:
+        return True
+
+    h = html.lower()
+
+    hard_markers = [
+        "captcha",
+        "access denied",
+        "forbidden",
+        "attention required",
+        "verify you are human",
+        "cloudflare",
+        "cf-chl",
+        "cf-ray",
+        "ddos-guard",
+        "request blocked",
+        "incapsula",
+        "distil networks",
+        "akamai",
+        "bot detection",
+        "unusual traffic",
+    ]
+    return any(x in h for x in hard_markers)
 
 
 # =========================
@@ -175,7 +186,7 @@ def _post_to_analyzer(payload: dict):
     url = f"{ANALYZER_BASE_URL}/analyze"
     headers = {"Content-Type": "application/json"}
 
-    # Debug minimal pour être sûr que CE watcher envoie bien content
+    # Debug minimal
     try:
         print(f"  DEBUG payload keys={list(payload.keys())} has_content={'content' in payload}", flush=True)
         if "content" in payload:
@@ -193,13 +204,11 @@ def _post_to_analyzer(payload: dict):
                 except Exception:
                     return resp.status_code, resp.text, None
 
-            # Retry on these
             if resp.status_code in (429, 500, 502, 503, 504):
                 if attempt < ANALYZER_RETRY:
                     time.sleep(1.2 * (attempt + 1))
                     continue
 
-            # Non-200: retourne un preview
             try:
                 j = resp.json()
                 body_preview = json.dumps(j, ensure_ascii=False)[:800]
@@ -220,16 +229,15 @@ def _post_to_analyzer(payload: dict):
 
 def analyze_listing(url: str):
     """
-    ✅ STRICT MODE:
-    - Copie-colle le HTML complet de Centris
-    - Valide que c'est la vraie fiche (sinon stop)
-    - Envoie {"url": url, "content": html} à l'analyseur
+    STRICT:
+    - fetch HTML complet
+    - vérifier blocage (hard) et vérifier que c'est une fiche
+    - envoyer {"url": url, "content": html} à l'analyseur
     """
     print(f"🧠 Analyse : {url}", flush=True)
 
     listing_id = extract_listing_id(url)
 
-    # 1) fetch HTML complet
     try:
         html = fetch_html_from_url(url)
     except Exception as e:
@@ -237,47 +245,43 @@ def analyze_listing(url: str):
         return {"_error": "fetch_failed", "_message": str(e), "_url": url}
 
     html_len = len(html) if html else 0
+    is_listing = looks_like_listing(html, listing_id) if listing_id else looks_like_listing(html, "")
+    hard_blocked = looks_hard_blocked(html)
+
     print(f"  📄 HTML length = {html_len}", flush=True)
+    print(f"  DEBUG listing_id={listing_id} hard_blocked={hard_blocked} looks_like_listing={is_listing}", flush=True)
 
-    blocked = looks_blocked(html)
-    is_listing = looks_like_listing(html, listing_id) if listing_id else False
-    print(f"  DEBUG listing_id={listing_id} blocked={blocked} looks_like_listing={is_listing}", flush=True)
-
-    # 2) si HTML pas la fiche => on stop, pas d'invention
-    if blocked:
+    # On déclare bloqué SEULEMENT si hard_blocked
+    if hard_blocked:
         return {
-            "_error": "html_blocked_or_consent",
-            "_message": "HTML semble être une page de blocage/consent/captcha (pas la fiche Centris).",
+            "_error": "html_hard_blocked",
+            "_message": "HTML semble être un challenge/captcha/blocked (hard markers).",
             "_html_len": html_len,
             "_url": url,
             "_listing_id": listing_id,
         }
 
-    # si pas certain que c'est la bonne fiche
-    if listing_id and not is_listing:
+    # Si pas hard blocked mais pas une fiche -> on stop (sinon analyzer parsera du bruit)
+    if not is_listing:
         return {
             "_error": "html_not_listing_page",
-            "_message": "HTML ne contient pas l'ID de l'annonce -> probablement pas la fiche complète.",
+            "_message": "HTML ne ressemble pas à une fiche Centris (pas __NEXT_DATA__, pas og/canonical, pas id).",
             "_html_len": html_len,
             "_url": url,
             "_listing_id": listing_id,
         }
 
-    # 3) POST à l'analyseur avec la clé attendue: content
+    # OK -> POST analyzer
     payload = {"url": url, "content": html}
     status, body_or_text, data = _post_to_analyzer(payload)
 
-    # erreurs réseau internes
     if isinstance(data, dict) and data.get("_error"):
-        print(f"  ❌ Analyzer network error: {data.get('_message')}", flush=True)
         data["_html_len"] = html_len
         data["_url"] = url
         data["_listing_id"] = listing_id
         return data
 
-    # HTTP non-200 ou JSON invalide
     if status != 200 or not isinstance(data, dict):
-        print(f"  ❌ Analyzer HTTP error: {status} body={body_or_text}", flush=True)
         return {
             "_error": "analyzer_http_error",
             "_status": status,
@@ -288,7 +292,6 @@ def analyze_listing(url: str):
             "_listing_id": listing_id,
         }
 
-    print("  ✅ Analyse OK", flush=True)
     return data
 
 
@@ -318,7 +321,6 @@ def send_discord_message(data: dict, url: str):
     if not DISCORD_WEBHOOK_URL:
         return
 
-    # Si erreur fetch/analyzer/html -> warning
     if isinstance(data, dict) and data.get("_error"):
         content = (
             f"{WATCHER_TAG}\n"
@@ -334,7 +336,6 @@ def send_discord_message(data: dict, url: str):
         requests.post(DISCORD_WEBHOOK_URL, json={"content": content}, timeout=30)
         return
 
-    # Si l'API renvoie une erreur applicative
     if isinstance(data, dict) and data.get("error"):
         content = (
             f"{WATCHER_TAG}\n"
@@ -346,7 +347,6 @@ def send_discord_message(data: dict, url: str):
         requests.post(DISCORD_WEBHOOK_URL, json={"content": content}, timeout=30)
         return
 
-    # Sinon -> Template 1 normal (si l'analyzer n'a pas les champs, ça restera N/A, mais pas inventé)
     inp = build_template1_inputs(data)
     out = compute_template1(inp)
     content = format_discord_template1(url, inp, out)
