@@ -19,6 +19,7 @@ REQUEST_INTERVAL_SECONDS = int(os.getenv("REQUEST_INTERVAL_SECONDS", "40"))
 FULL_SCAN_INTERVAL_SECONDS = int(os.getenv("FULL_SCAN_INTERVAL_SECONDS", "300"))
 
 SEEN_FILE = "seen_listings.json"
+WATCHER_TAG = "[WATCHER v2025-12-28]"
 
 
 def load_seen_ids():
@@ -26,6 +27,8 @@ def load_seen_ids():
         with open(SEEN_FILE, "r", encoding="utf-8") as f:
             return set(json.load(f))
     except FileNotFoundError:
+        return set()
+    except Exception:
         return set()
 
 
@@ -80,48 +83,6 @@ def get_listing_urls_from_search():
     return urls
 
 
-def analyze_listing(url: str):
-    print(f"🧠 Analyse : {url}", flush=True)
-
-    try:
-        html = fetch_html_from_url(url)
-    except Exception as e:
-        print(f"  ❌ Erreur fetch HTML : {e}", flush=True)
-        return None
-
-    html_len = len(html) if html else 0
-    print(f"  📄 HTML length = {html_len}", flush=True)
-
-    if not html or html_len < 50000:
-        print("  ⚠️ HTML suspect (trop petit). Probable blocage Centris.", flush=True)
-        return {"_error": "HTML suspect / blocage Centris", "_html_len": html_len}
-
-    try:
-        resp = requests.post(
-            f"{ANALYZER_BASE_URL}/analyze",
-            json={"content": html},
-            headers={"Content-Type": "application/json"},
-            timeout=120,
-        )
-    except Exception as e:
-        print(f"  ❌ Erreur réseau vers analyseur : {e}", flush=True)
-        return None
-
-    if resp.status_code != 200:
-        print(f"  ❌ Erreur HTTP {resp.status_code} : {resp.text[:300]}", flush=True)
-        return None
-
-    try:
-        data = resp.json()
-    except Exception:
-        print("  ❌ Réponse non JSON :", flush=True)
-        print(resp.text[:500], flush=True)
-        return None
-
-    print("  ✅ Analyse OK", flush=True)
-    return data
-
-
 # ✅ FIX: no nested def -> avoids indentation issues on Render
 def pick(d: dict, *paths, default=None):
     for path in paths:
@@ -135,6 +96,85 @@ def pick(d: dict, *paths, default=None):
         if ok and cur not in (None, "", "N/A"):
             return cur
     return default
+
+
+def _is_analysis_valid(data: dict) -> bool:
+    """
+    Empêche les posts "N/A partout".
+    On exige au moins 1 champ structurant (prix/revenu/taxes).
+    """
+    if not isinstance(data, dict):
+        return False
+
+    # Si API a renvoyé une erreur structurée
+    if data.get("error") or data.get("_error"):
+        return False
+
+    po = data.get("property_overview") or {}
+    rev = data.get("revenus") or {}
+    dep = data.get("depenses_vraies") or {}
+
+    price = po.get("prix")
+    revenu = rev.get("revenu_brut_potentiel_annuel")
+    taxes_mun = dep.get("taxes_municipales")
+    taxes_sco = dep.get("taxes_scolaires")
+
+    return any(v not in (None, "", 0) for v in (price, revenu, taxes_mun, taxes_sco))
+
+
+def _analysis_debug_line(data: dict) -> str:
+    if not isinstance(data, dict):
+        return "debug: data not dict"
+
+    ver = data.get("__analyzer_version__", "UNKNOWN")
+    raw = data.get("raw_debug", {})
+    api_dbg = data.get("_api_debug", {})
+    return f"ver={ver} api={api_dbg} raw_debug={raw}"
+
+
+def analyze_listing(url: str):
+    print(f"🧠 Analyse : {url}", flush=True)
+
+    try:
+        html = fetch_html_from_url(url)
+    except Exception as e:
+        print(f"  ❌ Erreur fetch HTML : {e}", flush=True)
+        return {"_error": "fetch_failed", "_message": str(e)}
+
+    html_len = len(html) if html else 0
+    print(f"  📄 HTML length = {html_len}", flush=True)
+
+    # ⚠️ Ancien seuil 50k trop agressif → on baisse.
+    # Beaucoup de pages Centris valides peuvent être < 50k.
+    if not html or html_len < 8000:
+        print("  ⚠️ HTML suspect (trop petit). Probable blocage Centris.", flush=True)
+        return {"_error": "html_too_short", "_html_len": html_len}
+
+    try:
+        resp = requests.post(
+            f"{ANALYZER_BASE_URL}/analyze",
+            # ✅ maintenant app.py accepte "html" (et aussi content/url)
+            json={"html": html},
+            headers={"Content-Type": "application/json"},
+            timeout=120,
+        )
+    except Exception as e:
+        print(f"  ❌ Erreur réseau vers analyseur : {e}", flush=True)
+        return {"_error": "analyzer_network_error", "_message": str(e)}
+
+    if resp.status_code != 200:
+        print(f"  ❌ Erreur HTTP {resp.status_code} : {resp.text[:300]}", flush=True)
+        return {"_error": "analyzer_http_error", "_status": resp.status_code, "_body": resp.text[:300]}
+
+    try:
+        data = resp.json()
+    except Exception:
+        print("  ❌ Réponse non JSON :", flush=True)
+        print(resp.text[:500], flush=True)
+        return {"_error": "analyzer_non_json", "_body": resp.text[:300]}
+
+    print("  ✅ Analyse OK", flush=True)
+    return data
 
 
 def build_template1_inputs(data: dict) -> Template1Inputs:
@@ -163,14 +203,50 @@ def send_discord_message(data: dict, url: str):
     if not DISCORD_WEBHOOK_URL:
         return
 
+    # 1) Si HTML bloqué ou erreur fetch/analyzer -> on poste un warning clair
     if isinstance(data, dict) and data.get("_error"):
-        content = f"⚠️ **HTML bloqué/incomplet** (len={data.get('_html_len')})\n{url}"
+        content = (
+            f"{WATCHER_TAG}\n"
+            f"⚠️ **Analyse impossible / bloquée**\n"
+            f"• reason: `{data.get('_error')}`\n"
+            f"• info: `{data.get('_html_len') or data.get('_status') or data.get('_message') or data.get('_body')}`\n"
+            f"{url}"
+        )
         requests.post(DISCORD_WEBHOOK_URL, json={"content": content}, timeout=30)
         return
 
+    # 2) Si API a renvoyé une erreur structurée -> warning
+    if isinstance(data, dict) and data.get("error"):
+        content = (
+            f"{WATCHER_TAG}\n"
+            f"⚠️ **API /analyze error**\n"
+            f"• error: `{data.get('error')}`\n"
+            f"• message: `{data.get('message')}`\n"
+            f"• debug: `{data.get('_api_debug')}`\n"
+            f"{url}"
+        )
+        requests.post(DISCORD_WEBHOOK_URL, json={"content": content}, timeout=30)
+        return
+
+    # 3) ✅ Guardrail: si analyse invalide -> PAS de Template 1 vide
+    if not _is_analysis_valid(data):
+        content = (
+            f"{WATCHER_TAG}\n"
+            f"⚠️ **Analyse invalide (skip Template 1)**\n"
+            f"• {_analysis_debug_line(data)}\n"
+            f"{url}"
+        )
+        requests.post(DISCORD_WEBHOOK_URL, json={"content": content}, timeout=30)
+        return
+
+    # 4) Sinon -> Template 1 normal
     inp = build_template1_inputs(data)
     out = compute_template1(inp)
     content = format_discord_template1(url, inp, out)
+
+    # ✅ tag watcher
+    content = f"{WATCHER_TAG}\n" + content
+
     requests.post(DISCORD_WEBHOOK_URL, json={"content": content}, timeout=30)
 
 
@@ -184,6 +260,7 @@ def run_one_full_scan():
             continue
 
         data = analyze_listing(url)
+
         if isinstance(data, dict):
             send_discord_message(data, url)
             seen.add(listing_id)
@@ -200,7 +277,7 @@ def main_loop():
 
 # ✅ Render-safe: crash -> retry (won't become "Failed service")
 if __name__ == "__main__":
-    print("[WATCHER] starting…", flush=True)
+    print(f"{WATCHER_TAG} starting…", flush=True)
 
     while True:
         try:
@@ -212,6 +289,3 @@ if __name__ == "__main__":
             print("[WATCHER] ERROR — restart in 60s", flush=True)
             traceback.print_exc()
             time.sleep(60)
-
-print('WATCHER_VERSION=2025-12-27-2245', flush=True)
-
