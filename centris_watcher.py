@@ -21,10 +21,16 @@ FULL_SCAN_INTERVAL_SECONDS = int(os.getenv("FULL_SCAN_INTERVAL_SECONDS", "300"))
 SEEN_FILE = "seen_listings.json"
 WATCHER_TAG = "[WATCHER v2025-12-28]"
 
-# Robust timeouts/retries
+# Timeouts/retries
 ANALYZER_TIMEOUT_SECONDS = int(os.getenv("ANALYZER_TIMEOUT_SECONDS", "120"))
 ANALYZER_RETRY = int(os.getenv("ANALYZER_RETRY", "2"))
 FETCH_TIMEOUT_SECONDS = int(os.getenv("FETCH_TIMEOUT_SECONDS", "30"))
+
+UA = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/121.0.0.0 Safari/537.36"
+)
 
 
 def load_seen_ids():
@@ -49,14 +55,13 @@ def extract_listing_id(url: str):
 
 def fetch_html_from_url(url: str) -> str:
     headers = {
-        "User-Agent": (
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-            "AppleWebKit/537.36 (KHTML, like Gecko) "
-            "Chrome/121.0.0.0 Safari/537.36"
-        ),
+        "User-Agent": UA,
         "Accept-Language": "fr-CA,fr;q=0.9,en;q=0.8",
         "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
         "Connection": "keep-alive",
+        "Cache-Control": "no-cache",
+        "Pragma": "no-cache",
+        "Upgrade-Insecure-Requests": "1",
     }
     resp = requests.get(url, headers=headers, timeout=FETCH_TIMEOUT_SECONDS)
     resp.raise_for_status()
@@ -65,7 +70,7 @@ def fetch_html_from_url(url: str) -> str:
 
 def get_listing_urls_from_search():
     print(f"🔎 Téléchargement : {CENTRIS_SEARCH_URL}", flush=True)
-    resp = requests.get(CENTRIS_SEARCH_URL, headers={"User-Agent": "Mozilla/5.0"}, timeout=FETCH_TIMEOUT_SECONDS)
+    resp = requests.get(CENTRIS_SEARCH_URL, headers={"User-Agent": UA}, timeout=FETCH_TIMEOUT_SECONDS)
     resp.raise_for_status()
 
     soup = BeautifulSoup(resp.text, "html.parser")
@@ -102,54 +107,26 @@ def pick(d: dict, *paths, default=None):
     return default
 
 
-def _is_analysis_valid(data: dict) -> bool:
-    """
-    Empêche les posts "N/A partout".
-    On exige au moins 1 champ structurant (prix/revenu/taxes).
-    """
-    if not isinstance(data, dict):
-        return False
-
-    # Si API a renvoyé une erreur structurée
-    if data.get("error") or data.get("_error"):
-        return False
-
-    po = data.get("property_overview") or {}
-    rev = data.get("revenus") or {}
-    dep = data.get("depenses_vraies") or {}
-
-    price = po.get("prix")
-    revenu = rev.get("revenu_brut_potentiel_annuel")
-    taxes_mun = dep.get("taxes_municipales")
-    taxes_sco = dep.get("taxes_scolaires")
-
-    return any(v not in (None, "", 0) for v in (price, revenu, taxes_mun, taxes_sco))
-
-
-def _analysis_debug_line(data: dict) -> str:
-    if not isinstance(data, dict):
-        return "debug: data not dict"
-
-    ver = data.get("__analyzer_version__", "UNKNOWN")
-    raw = data.get("raw_debug", {})
-    api_dbg = data.get("_api_debug", {})
-    return f"ver={ver} api={api_dbg} raw_debug={raw}"
-
-
 def _post_to_analyzer(payload: dict):
     """
     POST helper avec retries (timeout/5xx/429).
-    Retourne (status_code, text, json_or_none).
+    Retourne (status_code, text_preview, json_or_none_or_error_dict).
     """
     url = f"{ANALYZER_BASE_URL}/analyze"
     headers = {"Content-Type": "application/json"}
 
-    last_exc = None
+    # Debug minimal pour être sûr que CE watcher envoie bien content
+    try:
+        print(f"  DEBUG payload keys={list(payload.keys())} has_content={'content' in payload}", flush=True)
+        if "content" in payload:
+            print(f"  DEBUG html_len={len(payload['content']) if payload['content'] else 0}", flush=True)
+    except Exception:
+        pass
+
     for attempt in range(ANALYZER_RETRY + 1):
         try:
             resp = requests.post(url, json=payload, headers=headers, timeout=ANALYZER_TIMEOUT_SECONDS)
 
-            # OK
             if resp.status_code == 200:
                 try:
                     return resp.status_code, resp.text, resp.json()
@@ -161,83 +138,69 @@ def _post_to_analyzer(payload: dict):
                 if attempt < ANALYZER_RETRY:
                     time.sleep(1.2 * (attempt + 1))
                     continue
-                # fallthrough return
-            # no-retry by default
+
+            # Non-200: retourne un preview
             try:
                 j = resp.json()
-                body_preview = json.dumps(j, ensure_ascii=False)[:600]
+                body_preview = json.dumps(j, ensure_ascii=False)[:800]
             except Exception:
-                body_preview = resp.text[:600]
+                body_preview = (resp.text or "")[:800]
             return resp.status_code, body_preview, None
 
         except requests.exceptions.Timeout as e:
-            last_exc = e
             if attempt < ANALYZER_RETRY:
                 time.sleep(1.2 * (attempt + 1))
                 continue
             return None, None, {"_error": "analyzer_network_error", "_message": f"timeout: {e}"}
         except Exception as e:
-            last_exc = e
             return None, None, {"_error": "analyzer_network_error", "_message": str(e)}
 
-    return None, None, {"_error": "analyzer_network_error", "_message": str(last_exc) if last_exc else "unknown"}
+    return None, None, {"_error": "analyzer_network_error", "_message": "unknown"}
 
 
 def analyze_listing(url: str):
+    """
+    ✅ STRICT MODE:
+    - Copie-colle le HTML complet de Centris
+    - Envoie TOUJOURS {"url": url, "content": html} à l'analyseur
+    - Aucune invention
+    """
     print(f"🧠 Analyse : {url}", flush=True)
 
-    # ✅ TRY #1: laisser l'analyzer fetch lui-même (le plus fiable si ton analyzer sait bypass/headers)
-    status, body_or_text, data = _post_to_analyzer({"url": url})
-
-    # Si _post_to_analyzer a déjà renvoyé un dict d'erreur
-    if isinstance(data, dict) and data.get("_error"):
-        print(f"  ❌ Erreur réseau vers analyseur : {data.get('_message')}", flush=True)
-        return data
-
-    if status == 200 and isinstance(data, dict):
-        print("  ✅ Analyse OK (via url)", flush=True)
-        return data
-
-    # Si 400 "il faut fournir url ou content" -> ça ne devrait plus arriver, mais on gère quand même.
-    if status is not None and status != 200:
-        print(f"  ⚠️ Analyzer HTTP {status} via url : {body_or_text}", flush=True)
-
-    # ✅ FALLBACK: fetch HTML ici, puis envoyer content (clé attendue par l'analyzer)
+    # 1) fetch HTML complet
     try:
         html = fetch_html_from_url(url)
     except Exception as e:
         print(f"  ❌ Erreur fetch HTML : {e}", flush=True)
-        return {"_error": "fetch_failed", "_message": str(e)}
+        return {"_error": "fetch_failed", "_message": str(e), "_url": url}
 
     html_len = len(html) if html else 0
     print(f"  📄 HTML length = {html_len}", flush=True)
 
-    # ⚠️ Seuil anti-blocage (petit HTML = souvent page challenge/redirect)
-    if not html or html_len < 8000:
-        print("  ⚠️ HTML suspect (trop petit). Probable blocage Centris.", flush=True)
-        return {"_error": "html_too_short", "_html_len": html_len}
+    # 2) POST à l'analyseur avec la clé attendue: content
+    payload = {"url": url, "content": html}
+    status, body_or_text, data = _post_to_analyzer(payload)
 
-    # Envoi correct: content + url
-    status2, body2, data2 = _post_to_analyzer({"url": url, "content": html})
+    # erreurs réseau internes
+    if isinstance(data, dict) and data.get("_error"):
+        print(f"  ❌ Analyzer network error: {data.get('_message')}", flush=True)
+        data["_html_len"] = html_len
+        return data
 
-    if isinstance(data2, dict) and data2.get("_error"):
-        return data2
-
-    if status2 != 200:
-        print(f"  ❌ Erreur HTTP {status2} : {body2}", flush=True)
+    # HTTP non-200 ou JSON invalide
+    if status != 200 or not isinstance(data, dict):
+        print(f"  ❌ Analyzer HTTP error: {status} body={body_or_text}", flush=True)
         return {
             "_error": "analyzer_http_error",
-            "_status": status2,
-            "_body": body2,
-            "_html_len": html_len
+            "_status": status,
+            "_body": body_or_text,
+            "_message": None,
+            "_html_len": html_len,
+            "_url": url
         }
 
-    if not isinstance(data2, dict):
-        print("  ❌ Réponse non JSON :", flush=True)
-        return {"_error": "analyzer_non_json", "_body": (body2[:600] if isinstance(body2, str) else str(body2))}
-
-    print("  ✅ Analyse OK (via content)", flush=True)
-    return data2
+    print("  ✅ Analyse OK", flush=True)
+    return data
 
 
 def build_template1_inputs(data: dict) -> Template1Inputs:
@@ -266,46 +229,34 @@ def send_discord_message(data: dict, url: str):
     if not DISCORD_WEBHOOK_URL:
         return
 
-    # 1) Si HTML bloqué ou erreur fetch/analyzer -> warning clair
+    # Si erreur fetch/analyzer -> warning
     if isinstance(data, dict) and data.get("_error"):
         content = (
             f"{WATCHER_TAG}\n"
-            f"⚠️ **Analyse impossible / bloquée**\n"
-            f"• reason: `{data.get('_error')}`\n"
-            f"• status: `{data.get('_status')}`\n"
-            f"• body: `{data.get('_body')}`\n"
-            f"• message: `{data.get('_message')}`\n"
-            f"• html_len: `{data.get('_html_len')}`\n"
+            f"⚠️ Analyse impossible / bloquée\n"
+            f"• reason: {data.get('_error')}\n"
+            f"• status: {data.get('_status')}\n"
+            f"• body: {data.get('_body')}\n"
+            f"• message: {data.get('_message')}\n"
+            f"• html_len: {data.get('_html_len')}\n"
             f"{url}"
         )
         requests.post(DISCORD_WEBHOOK_URL, json={"content": content}, timeout=30)
         return
 
-    # 2) Si API a renvoyé une erreur structurée -> warning
+    # Si l'API renvoie une erreur applicative
     if isinstance(data, dict) and data.get("error"):
         content = (
             f"{WATCHER_TAG}\n"
-            f"⚠️ **API /analyze error**\n"
-            f"• error: `{data.get('error')}`\n"
-            f"• message: `{data.get('message')}`\n"
-            f"• debug: `{data.get('_api_debug')}`\n"
+            f"⚠️ API /analyze error\n"
+            f"• error: {data.get('error')}\n"
+            f"• message: {data.get('message')}\n"
             f"{url}"
         )
         requests.post(DISCORD_WEBHOOK_URL, json={"content": content}, timeout=30)
         return
 
-    # 3) Guardrail: analyse invalide -> PAS de Template 1 vide
-    if not _is_analysis_valid(data):
-        content = (
-            f"{WATCHER_TAG}\n"
-            f"⚠️ **Analyse invalide (skip Template 1)**\n"
-            f"• {_analysis_debug_line(data)}\n"
-            f"{url}"
-        )
-        requests.post(DISCORD_WEBHOOK_URL, json={"content": content}, timeout=30)
-        return
-
-    # 4) Sinon -> Template 1 normal
+    # Sinon -> Template 1 normal
     inp = build_template1_inputs(data)
     out = compute_template1(inp)
     content = format_discord_template1(url, inp, out)
@@ -318,7 +269,8 @@ def run_one_full_scan():
     seen = load_seen_ids()
     print(f"📂 {len(seen)} annonces déjà analysées.", flush=True)
 
-    for url in get_listing_urls_from_search():
+    urls = get_listing_urls_from_search()
+    for url in urls:
         listing_id = extract_listing_id(url)
         if not listing_id or listing_id in seen:
             continue
