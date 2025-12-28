@@ -6,13 +6,63 @@ import re
 from typing import Any, Dict, Optional, Tuple
 from bs4 import BeautifulSoup
 
-ANALYZER_VERSION = "v5-2025-12-28-full-header-price"
+ANALYZER_VERSION = "v6-2025-12-28-money-jsonld-price"
 
 
 # -----------------------------
 # Helpers
 # -----------------------------
+def _money_to_int(x: Any) -> Optional[int]:
+    """
+    Convertit un montant en int (CAD) en gérant les formats FR/EN:
+      - "908 000 $" -> 908000
+      - "3 120,00 $" -> 3120   ✅ (au lieu de 312000)
+      - "9,844" -> 9844
+      - 3120.0 -> 3120
+    """
+    if x is None or isinstance(x, bool):
+        return None
+    if isinstance(x, int):
+        return x
+    if isinstance(x, float):
+        return int(round(x))
+
+    s = str(x).replace("\u00a0", " ").replace("\u202f", " ").strip()
+
+    # garde chiffres, espaces, virgule, point, signe -
+    s2 = re.sub(r"[^0-9,\.\-\s]", "", s).strip()
+    if not s2:
+        return None
+
+    # enlève espaces (séparateurs de milliers)
+    s2 = re.sub(r"\s+", "", s2)
+
+    # Cas FR: 3120,00 (virgule décimale)
+    if "," in s2 and "." not in s2:
+        # si exactement 2 chiffres après virgule => décimal
+        if re.match(r"^-?\d+,\d{2}$", s2):
+            s2 = s2.replace(",", ".")
+            try:
+                return int(round(float(s2)))
+            except Exception:
+                return None
+        # sinon virgule = séparateur de milliers
+        s2 = s2.replace(",", "")
+
+    # Cas EN: 1,234.56 -> enlever virgules
+    if "," in s2 and "." in s2:
+        s2 = s2.replace(",", "")
+
+    try:
+        return int(round(float(s2)))
+    except Exception:
+        return None
+
+
 def _as_int(x: Any) -> Optional[int]:
+    """
+    Gardé pour les champs non-monétaires (unités, étages, superficies).
+    """
     if x is None or isinstance(x, bool):
         return None
     if isinstance(x, int):
@@ -20,8 +70,8 @@ def _as_int(x: Any) -> Optional[int]:
     if isinstance(x, float):
         return int(x)
     s = str(x).replace("\u00a0", " ").replace("\u202f", " ").strip()
-    digits = re.sub(r"[^\d]", "", s)
-    if not digits:
+    digits = re.sub(r"[^\d\-]", "", s)
+    if not digits or digits == "-":
         return None
     try:
         return int(digits)
@@ -34,15 +84,6 @@ def _as_str(x: Any) -> Optional[str]:
         return None
     s = str(x).strip()
     return s if s else None
-
-
-def _safe_get(d: Any, *keys, default=None):
-    cur = d
-    for k in keys:
-        if not isinstance(cur, dict) or k not in cur:
-            return default
-        cur = cur[k]
-    return cur
 
 
 def _extract_next_data_json(html: str) -> Optional[dict]:
@@ -61,9 +102,6 @@ def _extract_next_data_json(html: str) -> Optional[dict]:
 
 
 def _extract_centris_id_from_html(html: str) -> Optional[str]:
-    """
-    Extrait l'ID Centris (7-8 chiffres) via og:url / canonical / ou brute regex.
-    """
     if not html:
         return None
 
@@ -80,20 +118,67 @@ def _extract_centris_id_from_html(html: str) -> Optional[str]:
 
 
 # -----------------------------
-# Price extraction (header)
+# Price extraction (JSON-LD + header)
 # -----------------------------
-def _extract_display_price_from_header(html: str) -> Optional[int]:
+def _extract_price_from_jsonld(html: str) -> Optional[int]:
     """
-    Extrait le prix affiché en haut (ex: "908 000 $").
-    Priorité:
-      1) meta og/twitter/description
-      2) fenêtre autour de "à vendre"
-      3) fallback top N lignes
+    Cherche dans <script type="application/ld+json"> ... offers.price
     """
     if not html:
         return None
 
-    # 1) metas (souvent: "Duplex à vendre ... 908 000 $")
+    scripts = re.findall(
+        r'<script[^>]+type="application/ld\+json"[^>]*>(.*?)</script>',
+        html,
+        re.DOTALL | re.IGNORECASE
+    )
+    for raw in scripts:
+        raw = (raw or "").strip()
+        if not raw:
+            continue
+        try:
+            obj = json.loads(raw)
+        except Exception:
+            continue
+
+        candidates = obj if isinstance(obj, list) else [obj]
+        for it in candidates:
+            if not isinstance(it, dict):
+                continue
+            offers = it.get("offers")
+
+            if isinstance(offers, dict):
+                if offers.get("price") is not None:
+                    return _money_to_int(offers.get("price"))
+
+            elif isinstance(offers, list):
+                for off in offers:
+                    if isinstance(off, dict) and off.get("price") is not None:
+                        p = _money_to_int(off.get("price"))
+                        if p:
+                            return p
+
+    return None
+
+
+def _extract_display_price_from_header(html: str) -> Optional[int]:
+    """
+    Extrait le prix affiché en haut.
+    Priorité:
+      0) JSON-LD offers.price ✅
+      1) meta og/twitter/description
+      2) fenêtre autour de "à vendre" (en évitant les petits montants)
+      3) fallback top N lignes (en évitant les petits montants)
+    """
+    if not html:
+        return None
+
+    # 0) JSON-LD (le plus fiable)
+    p_jsonld = _extract_price_from_jsonld(html)
+    if p_jsonld and p_jsonld >= 20_000:  # un "prix" sous 20k est quasi jamais un prix d’immeuble
+        return p_jsonld
+
+    # 1) metas
     meta_patterns = [
         r'<meta[^>]+property="og:description"[^>]+content="([^"]+)"',
         r'<meta[^>]+name="twitter:description"[^>]+content="([^"]+)"',
@@ -103,29 +188,40 @@ def _extract_display_price_from_header(html: str) -> Optional[int]:
         m = re.search(pat, html, flags=re.IGNORECASE)
         if m:
             txt = m.group(1)
-            m2 = re.search(r'(\d[\d\s\u00a0\u202f]{2,})\s*\$', txt)
+            m2 = re.search(r'(\d[\d\s\u00a0\u202f,\.]{2,})\s*\$', txt)
             if m2:
-                return _as_int(m2.group(1))
+                p = _money_to_int(m2.group(1))
+                if p and p >= 20_000:
+                    return p
 
     soup = BeautifulSoup(html or "", "html.parser")
     lines = soup.get_text("\n", strip=True).replace("\u00a0", " ").replace("\u202f", " ").splitlines()
 
     # 2) fenêtre autour du premier "à vendre"
     idx = None
-    for i, ln in enumerate(lines[:500]):
+    for i, ln in enumerate(lines[:700]):
         if "à vendre" in ln.lower():
             idx = i
             break
     if idx is not None:
-        window = "\n".join(lines[idx: idx + 60])
-        m = re.search(r'(\d[\d\s]{2,})\s*\$', window)
-        if m:
-            return _as_int(m.group(1))
+        window = "\n".join(lines[idx: idx + 80])
+        # On cherche TOUS les montants $ dans la fenêtre et on prend le plus plausible (le plus grand >=20k)
+        candidates = []
+        for m in re.finditer(r'(\d[\d\s,\.]{2,})\s*\$', window):
+            p = _money_to_int(m.group(1))
+            if p and p >= 20_000:
+                candidates.append(p)
+        if candidates:
+            return max(candidates)
 
-    # 3) fallback: top 320 lignes
-    top = "\n".join(lines[:320])
-    m = re.search(r'(\d[\d\s]{2,})\s*\$', top)
-    return _as_int(m.group(1)) if m else None
+    # 3) fallback top 420 lignes
+    top = "\n".join(lines[:420])
+    candidates = []
+    for m in re.finditer(r'(\d[\d\s,\.]{2,})\s*\$', top):
+        p = _money_to_int(m.group(1))
+        if p and p >= 20_000:
+            candidates.append(p)
+    return max(candidates) if candidates else None
 
 
 # -----------------------------
@@ -148,7 +244,6 @@ def _score_listing_candidate(obj: dict) -> int:
     hits = len(keys.intersection(LISTING_SIGNAL_KEYS))
     score = min(hits, 12)
 
-    # Bonus pour champs très indicateurs
     if "taxes" in keys:
         score += 6
     if "price" in keys or "prix" in keys:
@@ -217,24 +312,24 @@ def _walk_find_best_listing(obj: Any) -> Tuple[Optional[dict], int]:
 
 
 def _extract_from_listing(listing: dict) -> Dict[str, Any]:
-    # prix
-    prix = _as_int(listing.get("price") if "price" in listing else listing.get("prix"))
+    # prix (monétaire)
+    prix = _money_to_int(listing.get("price") if "price" in listing else listing.get("prix"))
 
-    # revenu brut
+    # revenu brut (monétaire)
     revenu = listing.get("grossPotentialRevenue")
     if revenu is None:
         revenu = listing.get("revenusBrutsPotentiels")
-    revenu_brut = _as_int(revenu)
+    revenu_brut = _money_to_int(revenu)
 
-    # taxes
+    # taxes (monétaire)
     taxes = listing.get("taxes") if isinstance(listing.get("taxes"), dict) else None
     taxes_mun = None
     taxes_sco = None
     if taxes:
-        taxes_mun = _as_int(taxes.get("municipal") or taxes.get("municipales") or taxes.get("municipalTax"))
-        taxes_sco = _as_int(taxes.get("school") or taxes.get("scolaires") or taxes.get("schoolTax"))
+        taxes_mun = _money_to_int(taxes.get("municipal") or taxes.get("municipales") or taxes.get("municipalTax"))
+        taxes_sco = _money_to_int(taxes.get("school") or taxes.get("scolaires") or taxes.get("schoolTax"))
 
-    # nb logements
+    # nb logements (int normal)
     nb_logements = None
     units_obj = listing.get("units") if isinstance(listing.get("units"), dict) else None
     if units_obj:
@@ -265,7 +360,7 @@ def _extract_from_listing(listing: dict) -> Dict[str, Any]:
     # type propriété
     type_propriete = _as_str(listing.get("propertyType") or listing.get("typePropriete") or listing.get("buildingType"))
 
-    # building details
+    # building details (int normal)
     nb_etages = None
     superficie_habitable = None
     superficie_commerciale = None
@@ -279,7 +374,7 @@ def _extract_from_listing(listing: dict) -> Dict[str, Any]:
     if superficie_habitable is not None or superficie_commerciale is not None:
         superficie_totale = (superficie_habitable or 0) + (superficie_commerciale or 0)
 
-    # lot
+    # lot (int normal)
     superficie_terrain = None
     lot = listing.get("lot") if isinstance(listing.get("lot"), dict) else None
     if lot:
@@ -303,13 +398,12 @@ def _extract_from_listing(listing: dict) -> Dict[str, Any]:
 
 
 def _price_is_phantom(prix: Optional[int], revenu: Optional[int]) -> bool:
-    # prix absent
     if prix is None or prix <= 0:
         return True
-    # prix irréaliste (anti 20M / 26M)
     if prix >= 15_000_000:
         return True
-    # ratio prix/revenu (GRM) absurde
+    if prix < 20_000:  # ✅ évite les 1000$ etc.
+        return True
     if revenu and revenu > 0:
         if (prix / revenu) > 60:
             return True
@@ -324,23 +418,23 @@ def _fallback_text_extract(html: str) -> dict:
     text = soup.get_text("\n", strip=True).replace("\u00a0", " ").replace("\u202f", " ")
     text = re.sub(r"\s+", " ", text).strip()
 
-    # prix
-    m = re.search(r"(\d[\d\s,\.]{2,})\s*\$", text[:9000], flags=re.IGNORECASE)
-    prix = _as_int(m.group(1)) if m else None
+    # prix (monétaire)
+    m = re.search(r"(\d[\d\s,\.]{2,})\s*\$", text[:12000], flags=re.IGNORECASE)
+    prix = _money_to_int(m.group(1)) if m else None
 
-    # revenu brut potentiel
+    # revenu brut potentiel (monétaire)
     m = re.search(r"Revenus?\s+bruts?\s+potentiels?.*?(\d[\d\s,\.]{2,})\s*\$", text, flags=re.IGNORECASE)
-    revenu = _as_int(m.group(1)) if m else None
+    revenu = _money_to_int(m.group(1)) if m else None
 
-    # taxes mun / sco
+    # taxes (monétaire)
     m = re.search(r"Municipales?.*?(\d[\d\s,\.]{1,})\s*\$", text, flags=re.IGNORECASE)
-    taxes_mun = _as_int(m.group(1)) if m else None
+    taxes_mun = _money_to_int(m.group(1)) if m else None
     m = re.search(r"Scolaires?.*?(\d[\d\s,\.]{1,})\s*\$", text, flags=re.IGNORECASE)
-    taxes_sco = _as_int(m.group(1)) if m else None
+    taxes_sco = _money_to_int(m.group(1)) if m else None
 
     # type (simple)
     type_propriete = None
-    head = text[:1200]
+    head = text[:1600]
     for tp in ("Quadruplex", "Triplex", "Duplex"):
         if tp.lower() in head.lower():
             type_propriete = tp
@@ -395,10 +489,10 @@ def analyser_centris(html: str) -> dict:
         "raw_debug": {
             "has_next_data": False,
             "centris_id": None,
-            "picked_mode": None,           # by_id / best_score / fallback_text
+            "picked_mode": None,
             "best_listing_score": None,
             "display_price": None,
-            "price_source": None,          # header / next_data / fallback
+            "price_source": None,
             "phantom_filtered": False,
         },
     }
