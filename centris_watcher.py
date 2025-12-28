@@ -108,70 +108,80 @@ def pick(d: dict, *paths, default=None):
 
 
 # =========================
-# HTML VALIDATION (FIXED)
+# HTML VALIDATION
 # =========================
 
 def looks_like_listing(html: str, listing_id: str) -> bool:
-    """
-    Détermine si le HTML ressemble VRAIMENT à une fiche Centris.
-    Signaux forts:
-      - présence de __NEXT_DATA__ (Next.js)
-      - présence de l'ID de l'annonce dans le HTML
-      - présence de meta og:url / canonical contenant centris + l'id
-    """
     if not html:
         return False
 
     hlow = html.lower()
-
     if "centris" not in hlow:
         return False
 
-    # Next.js data (très fréquent sur les fiches)
+    # Next.js data (fréquent sur Centris)
     if 'id="__next_data__"' in hlow or "id='__next_data__'" in hlow:
         return True
 
+    # L'ID dans le HTML (souvent présent dans un JSON interne)
     if listing_id and listing_id in html:
         return True
 
     # og:url / canonical
     if listing_id:
-        if re.search(r'property="og:url"[^>]*content="[^"]*centris[^"]*' + re.escape(listing_id) + r'[^"]*"', html, re.IGNORECASE):
+        if re.search(
+            r'property="og:url"[^>]*content="[^"]*centris[^"]*' + re.escape(listing_id) + r'[^"]*"',
+            html,
+            re.IGNORECASE
+        ):
             return True
-        if re.search(r'rel="canonical"[^>]*href="[^"]*centris[^"]*' + re.escape(listing_id) + r'[^"]*"', html, re.IGNORECASE):
+        if re.search(
+            r'rel="canonical"[^>]*href="[^"]*centris[^"]*' + re.escape(listing_id) + r'[^"]*"',
+            html,
+            re.IGNORECASE
+        ):
             return True
 
     return False
 
 
-def looks_hard_blocked(html: str) -> bool:
+def detect_hard_block_marker(html: str):
     """
-    Détecte uniquement les VRAIS blocages/challenges.
-    IMPORTANT: on ne bloque plus pour "cookies/consent" (présent sur pages normales).
+    Retourne (is_blocked: bool, matched_marker: str|None)
+    IMPORTANT: on veut savoir EXACTEMENT quel marker a trigger.
     """
     if not html:
-        return True
+        return True, "empty_html"
 
     h = html.lower()
 
+    # MARKERS "durs" (captcha / blocage) — on garde serré, mais on log le match exact
     hard_markers = [
         "captcha",
         "access denied",
         "forbidden",
         "attention required",
         "verify you are human",
+
         "cloudflare",
         "cf-chl",
         "cf-ray",
+
         "ddos-guard",
-        "request blocked",
         "incapsula",
         "distil networks",
         "akamai",
+
+        "request blocked",
         "bot detection",
         "unusual traffic",
     ]
-    return any(x in h for x in hard_markers)
+
+    for mk in hard_markers:
+        if mk in h:
+            return True, mk
+
+    return False, None
 
 
 # =========================
@@ -179,14 +189,9 @@ def looks_hard_blocked(html: str) -> bool:
 # =========================
 
 def _post_to_analyzer(payload: dict):
-    """
-    POST helper avec retries (timeout/5xx/429).
-    Retourne (status_code, text_preview, json_or_none_or_error_dict).
-    """
     url = f"{ANALYZER_BASE_URL}/analyze"
     headers = {"Content-Type": "application/json"}
 
-    # Debug minimal
     try:
         print(f"  DEBUG payload keys={list(payload.keys())} has_content={'content' in payload}", flush=True)
         if "content" in payload:
@@ -228,12 +233,6 @@ def _post_to_analyzer(payload: dict):
 
 
 def analyze_listing(url: str):
-    """
-    STRICT:
-    - fetch HTML complet
-    - vérifier blocage (hard) et vérifier que c'est une fiche
-    - envoyer {"url": url, "content": html} à l'analyseur
-    """
     print(f"🧠 Analyse : {url}", flush=True)
 
     listing_id = extract_listing_id(url)
@@ -245,23 +244,23 @@ def analyze_listing(url: str):
         return {"_error": "fetch_failed", "_message": str(e), "_url": url}
 
     html_len = len(html) if html else 0
+
     is_listing = looks_like_listing(html, listing_id) if listing_id else looks_like_listing(html, "")
-    hard_blocked = looks_hard_blocked(html)
+    hard_blocked, matched_marker = detect_hard_block_marker(html)
 
     print(f"  📄 HTML length = {html_len}", flush=True)
-    print(f"  DEBUG listing_id={listing_id} hard_blocked={hard_blocked} looks_like_listing={is_listing}", flush=True)
+    print(f"  DEBUG listing_id={listing_id} hard_blocked={hard_blocked} matched_marker={matched_marker} looks_like_listing={is_listing}", flush=True)
 
-    # On déclare bloqué SEULEMENT si hard_blocked
     if hard_blocked:
         return {
             "_error": "html_hard_blocked",
             "_message": "HTML semble être un challenge/captcha/blocked (hard markers).",
+            "_blocked_marker": matched_marker,
             "_html_len": html_len,
             "_url": url,
             "_listing_id": listing_id,
         }
 
-    # Si pas hard blocked mais pas une fiche -> on stop (sinon analyzer parsera du bruit)
     if not is_listing:
         return {
             "_error": "html_not_listing_page",
@@ -271,7 +270,6 @@ def analyze_listing(url: str):
             "_listing_id": listing_id,
         }
 
-    # OK -> POST analyzer
     payload = {"url": url, "content": html}
     status, body_or_text, data = _post_to_analyzer(payload)
 
@@ -326,6 +324,7 @@ def send_discord_message(data: dict, url: str):
             f"{WATCHER_TAG}\n"
             f"⚠️ Analyse impossible / bloquée\n"
             f"• reason: {data.get('_error')}\n"
+            f"• marker: {data.get('_blocked_marker')}\n"
             f"• status: {data.get('_status')}\n"
             f"• body: {data.get('_body')}\n"
             f"• message: {data.get('_message')}\n"
