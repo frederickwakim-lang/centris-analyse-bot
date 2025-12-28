@@ -1,26 +1,18 @@
-from dotenv import load_dotenv
-load_dotenv()  # Charge .env en local (sur Render, il ignore si pas là)
+﻿from dotenv import load_dotenv
+load_dotenv()
 
 import os
 import json
 import time
 import re
 import requests
+import traceback
 from bs4 import BeautifulSoup
 
 from template1_calcs import Template1Inputs, compute_template1, format_discord_template1
 
-
-CENTRIS_SEARCH_URL = os.getenv(
-    "CENTRIS_SEARCH_URL",
-    "https://www.centris.ca/fr/plex~a-vendre?uc=0",
-)
-
-ANALYZER_BASE_URL = os.getenv(
-    "ANALYZER_BASE_URL",
-    "https://centris-analyse-bot.onrender.com",
-).rstrip("/")
-
+CENTRIS_SEARCH_URL = os.getenv("CENTRIS_SEARCH_URL", "https://www.centris.ca/fr/plex~a-vendre?uc=0")
+ANALYZER_BASE_URL = os.getenv("ANALYZER_BASE_URL", "https://centris-analyse-bot.onrender.com").rstrip("/")
 DISCORD_WEBHOOK_URL = os.getenv("DISCORD_WEBHOOK_URL")
 
 REQUEST_INTERVAL_SECONDS = int(os.getenv("REQUEST_INTERVAL_SECONDS", "40"))
@@ -64,12 +56,8 @@ def fetch_html_from_url(url: str) -> str:
 
 
 def get_listing_urls_from_search():
-    print(f"🔎 Téléchargement : {CENTRIS_SEARCH_URL}")
-    resp = requests.get(
-        CENTRIS_SEARCH_URL,
-        headers={"User-Agent": "Mozilla/5.0"},
-        timeout=30,
-    )
+    print(f"🔎 Téléchargement : {CENTRIS_SEARCH_URL}", flush=True)
+    resp = requests.get(CENTRIS_SEARCH_URL, headers={"User-Agent": "Mozilla/5.0"}, timeout=30)
     resp.raise_for_status()
 
     soup = BeautifulSoup(resp.text, "html.parser")
@@ -80,34 +68,32 @@ def get_listing_urls_from_search():
 
         if "plexes-for-sale" in href or "view=Map" in href:
             continue
-
         if not href.startswith("/fr/"):
             continue
         if not any(x in href for x in ["/duplex", "/triplex", "/quadruplex", "/plex"]):
             continue
 
-        full_url = "https://www.centris.ca" + href
-        urls.append(full_url)
+        urls.append("https://www.centris.ca" + href)
 
     urls = list(dict.fromkeys(urls))
-    print(f"➡️ {len(urls)} URLs trouvées")
+    print(f"➡️ {len(urls)} URLs trouvées", flush=True)
     return urls
 
 
 def analyze_listing(url: str):
-    print(f"🧠 Analyse : {url}")
+    print(f"🧠 Analyse : {url}", flush=True)
 
     try:
         html = fetch_html_from_url(url)
     except Exception as e:
-        print(f"  ❌ Erreur fetch HTML : {e}")
+        print(f"  ❌ Erreur fetch HTML : {e}", flush=True)
         return None
 
     html_len = len(html) if html else 0
-    print(f"  📄 HTML length = {html_len}")
+    print(f"  📄 HTML length = {html_len}", flush=True)
 
     if not html or html_len < 50000:
-        print("  ⚠️ HTML suspect (trop petit). Probable blocage Centris.")
+        print("  ⚠️ HTML suspect (trop petit). Probable blocage Centris.", flush=True)
         return {"_error": "HTML suspect / blocage Centris", "_html_len": html_len}
 
     try:
@@ -118,25 +104,114 @@ def analyze_listing(url: str):
             timeout=120,
         )
     except Exception as e:
-        print(f"  ❌ Erreur réseau vers analyseur : {e}")
+        print(f"  ❌ Erreur réseau vers analyseur : {e}", flush=True)
         return None
 
     if resp.status_code != 200:
-        print(f"  ❌ Erreur HTTP {resp.status_code} : {resp.text[:300]}")
+        print(f"  ❌ Erreur HTTP {resp.status_code} : {resp.text[:300]}", flush=True)
         return None
 
     try:
         data = resp.json()
     except Exception:
-        print("  ❌ Réponse non JSON :")
-        print(resp.text[:500])
+        print("  ❌ Réponse non JSON :", flush=True)
+        print(resp.text[:500], flush=True)
         return None
 
-    print("  ✅ Analyse OK")
+    print("  ✅ Analyse OK", flush=True)
     return data
 
 
-# ========= MAPPING ROBUSTE =========
-
+# ✅ FIX: no nested def -> avoids indentation issues on Render
 def pick(d: dict, *paths, default=None):
-    def get_path(obj, path):
+    for path in paths:
+        cur = d
+        ok = True
+        for k in path:
+            if not isinstance(cur, dict) or k not in cur:
+                ok = False
+                break
+            cur = cur[k]
+        if ok and cur not in (None, "", "N/A"):
+            return cur
+    return default
+
+
+def build_template1_inputs(data: dict) -> Template1Inputs:
+    price = pick(data, ("property_overview", "prix"))
+    units = pick(data, ("property_overview", "nb_logements"))
+    revenu_brut_annuel = pick(data, ("revenus", "revenu_brut_potentiel_annuel"))
+    taxes_scolaires = pick(data, ("depenses_vraies", "taxes_scolaires"))
+    taxes_municipales = pick(data, ("depenses_vraies", "taxes_municipales"))
+
+    return Template1Inputs(
+        price=price,
+        units=units,
+        revenu_brut_annuel=revenu_brut_annuel,
+        taxes_scolaires=taxes_scolaires,
+        taxes_municipales=taxes_municipales,
+        assurances=None,
+        services_publics=None,
+        electricite=None,
+        chauffage=None,
+        deneigement=None,
+        conciergerie=None,
+    )
+
+
+def send_discord_message(data: dict, url: str):
+    if not DISCORD_WEBHOOK_URL:
+        return
+
+    if isinstance(data, dict) and data.get("_error"):
+        content = f"⚠️ **HTML bloqué/incomplet** (len={data.get('_html_len')})\n{url}"
+        requests.post(DISCORD_WEBHOOK_URL, json={"content": content}, timeout=30)
+        return
+
+    inp = build_template1_inputs(data)
+    out = compute_template1(inp)
+    content = format_discord_template1(url, inp, out)
+    requests.post(DISCORD_WEBHOOK_URL, json={"content": content}, timeout=30)
+
+
+def run_one_full_scan():
+    seen = load_seen_ids()
+    print(f"📂 {len(seen)} annonces déjà analysées.", flush=True)
+
+    for url in get_listing_urls_from_search():
+        listing_id = extract_listing_id(url)
+        if not listing_id or listing_id in seen:
+            continue
+
+        data = analyze_listing(url)
+        if isinstance(data, dict):
+            send_discord_message(data, url)
+            seen.add(listing_id)
+            save_seen_ids(seen)
+
+        time.sleep(REQUEST_INTERVAL_SECONDS)
+
+
+def main_loop():
+    while True:
+        run_one_full_scan()
+        time.sleep(FULL_SCAN_INTERVAL_SECONDS)
+
+
+# ✅ Render-safe: crash -> retry (won't become "Failed service")
+if __name__ == "__main__":
+    print("[WATCHER] starting…", flush=True)
+
+    while True:
+        try:
+            main_loop()
+        except KeyboardInterrupt:
+            print("[WATCHER] stopped by user", flush=True)
+            raise
+        except Exception:
+            print("[WATCHER] ERROR — restart in 60s", flush=True)
+            traceback.print_exc()
+            time.sleep(60)
+
+print('WATCHER_VERSION=2025-12-27-2245', flush=True)
+
