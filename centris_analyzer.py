@@ -1,9 +1,9 @@
 import re
 import json
-from typing import Any, Optional, Dict
+from typing import Any, Optional, Dict, Tuple, List, Iterable
 from bs4 import BeautifulSoup
 
-ANALYZER_VERSION = "v7-2025-12-28-label-based"
+ANALYZER_VERSION = "v8-2025-12-28-nextdata-first"
 
 
 # -----------------------------
@@ -61,8 +61,15 @@ def _as_int(x: Any) -> Optional[int]:
 
 
 # -----------------------------
-# Extraction helpers
+# HTML helpers
 # -----------------------------
+def _clean_text_lines(html: str):
+    soup = BeautifulSoup(html or "", "html.parser")
+    lines = soup.get_text("\n", strip=True).replace("\u00a0", " ").replace("\u202f", " ").splitlines()
+    lines = [ln.strip() for ln in lines if ln.strip()]
+    return lines
+
+
 def _extract_price_jsonld(html: str) -> Optional[int]:
     if not html:
         return None
@@ -110,21 +117,13 @@ def _first_match_money(text: str, patterns) -> Optional[int]:
     return None
 
 
-def _clean_text_lines(html: str):
-    soup = BeautifulSoup(html or "", "html.parser")
-    lines = soup.get_text("\n", strip=True).replace("\u00a0", " ").replace("\u202f", " ").splitlines()
-    lines = [ln.strip() for ln in lines if ln.strip()]
-    return lines
-
-
 def _extract_price_from_visible(lines) -> Optional[int]:
     """
-    On cherche le prix autour de 'à vendre' / 'for sale' et on prend le montant plausible.
-    On ignore 20,000,000 explicitement (placeholder).
+    Fallback ultime: essaie de retrouver un prix dans le texte visible.
+    (Moins fiable que le JSON, utilisé seulement si JSON absent.)
     """
     blob_top = "\n".join(lines[:350])
 
-    # 1) fenêtre autour de "à vendre" / "for sale"
     idx = None
     for i, ln in enumerate(lines[:700]):
         low = ln.lower()
@@ -141,28 +140,24 @@ def _extract_price_from_visible(lines) -> Optional[int]:
             if p:
                 candidates.append(p)
 
-    # 2) fallback top blob
     if not candidates:
         for m in re.finditer(r'(\d[\d\s,\.]{2,})\s*\$', blob_top):
             p = _money_to_int(m.group(1))
             if p:
                 candidates.append(p)
 
-    # Filtre: supprimer montants non plausibles
-    candidates = [p for p in candidates if p not in (20_000_000, 26_908_000)]  # 26,908,000 vu chez toi: bug pareil
+    candidates = [p for p in candidates if p not in (20_000_000, 26_908_000)]
     candidates = [p for p in candidates if 20_000 <= p <= 15_000_000]
 
     if not candidates:
         return None
 
-    # sur Centris, le vrai prix est souvent le plus "mis en avant" => souvent le max plausible dans la fenêtre
     return max(candidates)
 
 
 def _extract_revenue_from_visible(lines) -> Optional[int]:
     text = "\n".join(lines)
 
-    # FR/EN variants
     patterns = [
         r"revenu(?:s)?\s+brut(?:s)?\s+potentiel(?:s)?.*?(\d[\d\s,\.]{1,})\s*\$",
         r"revenu\s+brut.*?(\d[\d\s,\.]{1,})\s*\$",
@@ -173,7 +168,7 @@ def _extract_revenue_from_visible(lines) -> Optional[int]:
     if v is None:
         return None
 
-    # Heuristique Centris: parfois ils affichent "$24" pour "$24,000"
+    # Heuristique Centris: parfois "$24" => "$24,000"
     if 0 < v < 1000:
         v = v * 1000
 
@@ -204,7 +199,7 @@ def _extract_units_from_visible(lines) -> Optional[int]:
     patterns = [
         r"nombre\s+de\s+logements?\s*:?[\s\-]*([0-9]{1,3})",
         r"number\s+of\s+units?\s*:?[\s\-]*([0-9]{1,3})",
-        r"residential\s*\((\d{1,3})\)",  # "Residential (2)"
+        r"residential\s*\((\d{1,3})\)",
     ]
 
     for pat in patterns:
@@ -217,26 +212,280 @@ def _extract_units_from_visible(lines) -> Optional[int]:
 
 
 # -----------------------------
+# JSON extraction (Centris / Next.js)
+# -----------------------------
+def _extract_next_data(html: str) -> Tuple[Optional[dict], Optional[str]]:
+    """
+    Cherche __NEXT_DATA__ (Next.js) ou un script JSON similaire.
+    Retourne (json_obj, error_message).
+    """
+    if not html:
+        return None, "empty_html"
+
+    soup = BeautifulSoup(html, "html.parser")
+
+    # 1) Next.js canonical
+    s = soup.find("script", id="__NEXT_DATA__")
+    if s and s.string:
+        raw = s.string.strip()
+        try:
+            return json.loads(raw), None
+        except Exception as e:
+            return None, f"next_data_json_error:{e}"
+
+    # 2) fallback: script type application/json (rare, mais parfois)
+    for sc in soup.find_all("script"):
+        t = (sc.get("type") or "").lower().strip()
+        if t in ("application/json", "application/ld+json"):
+            continue
+        # certains sites ont un gros JSON sans type; on évite de tout parse aveuglément.
+    return None, "next_data_not_found"
+
+
+def _iter_json(obj: Any, path: Tuple[Any, ...] = ()) -> Iterable[Tuple[Tuple[Any, ...], Any]]:
+    """
+    Parcours récursif de JSON (dict/list) pour pouvoir chercher des clés n'importe où.
+    Yields: (path, value)
+    """
+    yield path, obj
+    if isinstance(obj, dict):
+        for k, v in obj.items():
+            yield from _iter_json(v, path + (k,))
+    elif isinstance(obj, list):
+        for i, v in enumerate(obj):
+            yield from _iter_json(v, path + (i,))
+
+
+def _key_match(k: str, includes: List[str], excludes: List[str] = None) -> bool:
+    kk = str(k).lower()
+    if excludes:
+        for ex in excludes:
+            if ex in kk:
+                return False
+    return all(inc in kk for inc in includes)
+
+
+def _find_money_in_json(next_data: dict, includes: List[str], excludes: List[str] = None,
+                        min_v: int = 0, max_v: int = 10**12) -> Tuple[Optional[int], Optional[Tuple[Any, ...]]]:
+    """
+    Cherche une valeur monétaire (int) dans le JSON, en matchant des clés par fragments.
+    """
+    best = None
+    best_path = None
+
+    for path, val in _iter_json(next_data):
+        if not path:
+            continue
+        key = path[-1]
+        if not isinstance(key, str):
+            continue
+        if not _key_match(key, includes=includes, excludes=excludes or []):
+            continue
+
+        mv = _money_to_int(val)
+        if mv is None:
+            continue
+        if not (min_v <= mv <= max_v):
+            continue
+
+        # On prend la première plausible (tu peux raffiner ensuite)
+        best = mv
+        best_path = path
+        break
+
+    return best, best_path
+
+
+def _find_int_in_json(next_data: dict, includes: List[str], excludes: List[str] = None,
+                      min_v: int = 0, max_v: int = 10**9) -> Tuple[Optional[int], Optional[Tuple[Any, ...]]]:
+    best = None
+    best_path = None
+
+    for path, val in _iter_json(next_data):
+        if not path:
+            continue
+        key = path[-1]
+        if not isinstance(key, str):
+            continue
+        if not _key_match(key, includes=includes, excludes=excludes or []):
+            continue
+
+        iv = _as_int(val)
+        if iv is None:
+            continue
+        if not (min_v <= iv <= max_v):
+            continue
+
+        best = iv
+        best_path = path
+        break
+
+    return best, best_path
+
+
+# -----------------------------
 # Main
 # -----------------------------
 def analyser_centris(html: str) -> dict:
     lines = _clean_text_lines(html)
 
+    # 1) JSON sources
+    next_data, next_err = _extract_next_data(html)
+    has_next = isinstance(next_data, dict)
+
+    # 2) Prix: JSON-LD -> NextData -> Visible
     price_jsonld = _extract_price_jsonld(html)
+
+    price_next = None
+    price_next_path = None
+    if has_next:
+        # clés possibles (varient) — on cherche large mais sans inventer
+        # On exclut des clés qui ressemblent à des taxes/fees
+        price_next, price_next_path = _find_money_in_json(
+            next_data,
+            includes=["price"],
+            excludes=["tax", "fee", "unit", "maintenance", "school", "municipal"],
+            min_v=20_000,
+            max_v=15_000_000
+        )
+        # si "price" pas trouvé, on tente "asking" / "list"
+        if price_next is None:
+            price_next, price_next_path = _find_money_in_json(
+                next_data,
+                includes=["list"],
+                excludes=["tax", "fee"],
+                min_v=20_000,
+                max_v=15_000_000
+            )
+        if price_next is None:
+            price_next, price_next_path = _find_money_in_json(
+                next_data,
+                includes=["ask"],
+                excludes=["tax", "fee"],
+                min_v=20_000,
+                max_v=15_000_000
+            )
+
     price_visible = _extract_price_from_visible(lines)
 
-    # Prix final: JSON-LD si plausible sinon visible
     prix = None
     price_source = None
-    for candidate, src in ((price_jsonld, "jsonld"), (price_visible, "visible")):
-        if candidate and 20_000 <= candidate <= 15_000_000 and candidate != 20_000_000:
+    price_path = None
+
+    # Priorité: jsonld, next, visible
+    for candidate, src, pth in (
+        (price_jsonld, "jsonld", None),
+        (price_next, "next_data", price_next_path),
+        (price_visible, "visible", None),
+    ):
+        if candidate and 20_000 <= candidate <= 15_000_000 and candidate not in (20_000_000, 26_908_000):
             prix = candidate
             price_source = src
+            price_path = pth
             break
 
-    revenu = _extract_revenue_from_visible(lines)
-    taxes = _extract_taxes_from_visible(lines)
-    units = _extract_units_from_visible(lines)
+    # 3) Revenus/Taxes/Units: NextData d'abord, sinon visible
+    revenu = None
+    revenu_source = None
+    revenu_path = None
+
+    taxes_mun = None
+    taxes_mun_source = None
+    taxes_mun_path = None
+
+    taxes_sco = None
+    taxes_sco_source = None
+    taxes_sco_path = None
+
+    units = None
+    units_source = None
+    units_path = None
+
+    if has_next:
+        # Revenus (gross revenue / income)
+        revenu, revenu_path = _find_money_in_json(
+            next_data,
+            includes=["gross", "rev"],
+            excludes=[],
+            min_v=0,
+            max_v=200_000_000
+        )
+        if revenu is None:
+            revenu, revenu_path = _find_money_in_json(
+                next_data,
+                includes=["revenue"],
+                excludes=["tax"],
+                min_v=0,
+                max_v=200_000_000
+            )
+        if revenu is not None:
+            # Heuristique "$24" => "$24,000" si on reçoit une valeur trop petite
+            if 0 < revenu < 1000:
+                revenu = revenu * 1000
+            revenu_source = "next_data"
+
+        # Taxes municipales
+        taxes_mun, taxes_mun_path = _find_money_in_json(
+            next_data,
+            includes=["municipal", "tax"],
+            excludes=[],
+            min_v=0,
+            max_v=50_000_000
+        )
+        if taxes_mun is not None:
+            taxes_mun_source = "next_data"
+
+        # Taxes scolaires
+        taxes_sco, taxes_sco_path = _find_money_in_json(
+            next_data,
+            includes=["school", "tax"],
+            excludes=[],
+            min_v=0,
+            max_v=50_000_000
+        )
+        if taxes_sco is not None:
+            taxes_sco_source = "next_data"
+
+        # Units
+        units, units_path = _find_int_in_json(
+            next_data,
+            includes=["unit"],
+            excludes=["suite", "community", "maintenance"],
+            min_v=1,
+            max_v=500
+        )
+        if units is None:
+            units, units_path = _find_int_in_json(
+                next_data,
+                includes=["logement"],
+                excludes=[],
+                min_v=1,
+                max_v=500
+            )
+        if units is not None:
+            units_source = "next_data"
+
+    # Visible fallbacks (si JSON n'a rien)
+    if revenu is None:
+        revenu = _extract_revenue_from_visible(lines)
+        if revenu is not None:
+            revenu_source = "visible"
+
+    if taxes_mun is None or taxes_sco is None:
+        taxes_vis = _extract_taxes_from_visible(lines)
+        if taxes_mun is None:
+            taxes_mun = taxes_vis.get("taxes_municipales")
+            if taxes_mun is not None:
+                taxes_mun_source = "visible"
+        if taxes_sco is None:
+            taxes_sco = taxes_vis.get("taxes_scolaires")
+            if taxes_sco is not None:
+                taxes_sco_source = "visible"
+
+    if units is None:
+        units = _extract_units_from_visible(lines)
+        if units is not None:
+            units_source = "visible"
 
     out = {
         "__analyzer_version__": ANALYZER_VERSION,
@@ -251,16 +500,29 @@ def analyser_centris(html: str) -> dict:
             "revenu_brut_potentiel_annuel": revenu
         },
         "depenses_vraies": {
-            "taxes_municipales": taxes.get("taxes_municipales"),
-            "taxes_scolaires": taxes.get("taxes_scolaires"),
+            "taxes_municipales": taxes_mun,
+            "taxes_scolaires": taxes_sco,
         },
         "raw_debug": {
+            "has_next_data": has_next,
+            "next_data_error": next_err,
             "price_jsonld": price_jsonld,
+            "price_next": price_next,
             "price_visible": price_visible,
             "price_source": price_source,
+            "price_path": price_path,
+            "revenu_source": revenu_source,
+            "revenu_path": revenu_path,
+            "taxes_mun_source": taxes_mun_source,
+            "taxes_mun_path": taxes_mun_path,
+            "taxes_sco_source": taxes_sco_source,
+            "taxes_sco_path": taxes_sco_path,
+            "units_source": units_source,
+            "units_path": units_path,
             "lines_top_sample": lines[:25],
         }
     }
 
     return out
+
 
