@@ -8,6 +8,7 @@ from centris_analyzer import analyser_centris
 load_dotenv()
 
 app = Flask(__name__)
+app.config["MAX_CONTENT_LENGTH"] = 15 * 1024 * 1024  # 15 MB
 
 
 def fetch_html_from_url(url: str) -> str:
@@ -85,15 +86,14 @@ def api_analyze():
     JSON d'entrée accepté:
       - {"url": "https://..."}
       - {"content": "<html>...</html>"}
-      - {"html": "<html>...</html>"}   ✅ (compat watcher)
+      - {"html": "<html>...</html>"}   ✅ compat watcher
     """
     body = request.get_json(silent=True) or {}
 
     url = body.get("url")
     content = body.get("content")
-    html_direct = body.get("html")  # ✅ compat
+    html_direct = body.get("html")
 
-    # choisir la source
     html = None
     source = None
 
@@ -118,9 +118,11 @@ def api_analyze():
         html = content
 
     else:
-        return jsonify({"error": "missing_input", "message": "Il faut fournir 'url' ou 'content' ou 'html'."}), 400
+        return jsonify({
+            "error": "missing_input",
+            "message": "Il faut fournir 'url' ou 'content' ou 'html'."
+        }), 400
 
-    # 🔒 garde-fou: HTML trop court = pas une vraie page Centris
     if not html or len(html) < 2000:
         return jsonify({
             "error": "missing_or_too_short_html",
@@ -131,7 +133,6 @@ def api_analyze():
     try:
         data = analyser_centris(html)
 
-        # 🔒 toujours retourner ces clés
         if isinstance(data, dict):
             data.setdefault("__analyzer_version__", "UNKNOWN")
             data.setdefault("raw_debug", {})
@@ -149,6 +150,12 @@ def api_analyze():
             "message": str(e),
             "source": source,
         }), 500
+
+
+# ✅ ALIAS POUR TAMPERMONKEY
+@app.post("/api/analyze_html")
+def api_analyze_html():
+    return api_analyze()
 
 
 @app.route("/health", methods=["GET"])
