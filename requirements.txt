@@ -1,8 +1,9 @@
 flask
+gunicorn
 python-dotenv
 openai>=1.6.0
 requests
 beautifulsoup4
-apscheduler
 bs4
+apscheduler
 
