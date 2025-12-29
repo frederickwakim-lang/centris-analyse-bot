@@ -211,6 +211,24 @@ def _extract_units_from_visible(lines) -> Optional[int]:
     return None
 
 
+# ✅ NOUVEAU: Units depuis le titre (Triplex/Duplex/Quadruplex)
+def _extract_units_from_title(lines) -> Optional[int]:
+    """
+    Déduit le nombre d'unités à partir du titre (Triplex, Duplex, etc.)
+    """
+    for ln in lines[:10]:
+        low = ln.lower()
+        if "triplex" in low:
+            return 3
+        if "duplex" in low:
+            return 2
+        if "quadruplex" in low or "4-plex" in low:
+            return 4
+        if "5-plex" in low:
+            return 5
+    return None
+
+
 # -----------------------------
 # JSON extraction (Centris / Next.js)
 # -----------------------------
@@ -233,12 +251,6 @@ def _extract_next_data(html: str) -> Tuple[Optional[dict], Optional[str]]:
         except Exception as e:
             return None, f"next_data_json_error:{e}"
 
-    # 2) fallback: script type application/json (rare, mais parfois)
-    for sc in soup.find_all("script"):
-        t = (sc.get("type") or "").lower().strip()
-        if t in ("application/json", "application/ld+json"):
-            continue
-        # certains sites ont un gros JSON sans type; on évite de tout parse aveuglément.
     return None, "next_data_not_found"
 
 
@@ -288,7 +300,6 @@ def _find_money_in_json(next_data: dict, includes: List[str], excludes: List[str
         if not (min_v <= mv <= max_v):
             continue
 
-        # On prend la première plausible (tu peux raffiner ensuite)
         best = mv
         best_path = path
         break
@@ -339,8 +350,6 @@ def analyser_centris(html: str) -> dict:
     price_next = None
     price_next_path = None
     if has_next:
-        # clés possibles (varient) — on cherche large mais sans inventer
-        # On exclut des clés qui ressemblent à des taxes/fees
         price_next, price_next_path = _find_money_in_json(
             next_data,
             includes=["price"],
@@ -348,7 +357,6 @@ def analyser_centris(html: str) -> dict:
             min_v=20_000,
             max_v=15_000_000
         )
-        # si "price" pas trouvé, on tente "asking" / "list"
         if price_next is None:
             price_next, price_next_path = _find_money_in_json(
                 next_data,
@@ -372,7 +380,6 @@ def analyser_centris(html: str) -> dict:
     price_source = None
     price_path = None
 
-    # Priorité: jsonld, next, visible
     for candidate, src, pth in (
         (price_jsonld, "jsonld", None),
         (price_next, "next_data", price_next_path),
@@ -402,7 +409,6 @@ def analyser_centris(html: str) -> dict:
     units_path = None
 
     if has_next:
-        # Revenus (gross revenue / income)
         revenu, revenu_path = _find_money_in_json(
             next_data,
             includes=["gross", "rev"],
@@ -419,12 +425,10 @@ def analyser_centris(html: str) -> dict:
                 max_v=200_000_000
             )
         if revenu is not None:
-            # Heuristique "$24" => "$24,000" si on reçoit une valeur trop petite
             if 0 < revenu < 1000:
                 revenu = revenu * 1000
             revenu_source = "next_data"
 
-        # Taxes municipales
         taxes_mun, taxes_mun_path = _find_money_in_json(
             next_data,
             includes=["municipal", "tax"],
@@ -435,7 +439,6 @@ def analyser_centris(html: str) -> dict:
         if taxes_mun is not None:
             taxes_mun_source = "next_data"
 
-        # Taxes scolaires
         taxes_sco, taxes_sco_path = _find_money_in_json(
             next_data,
             includes=["school", "tax"],
@@ -446,7 +449,6 @@ def analyser_centris(html: str) -> dict:
         if taxes_sco is not None:
             taxes_sco_source = "next_data"
 
-        # Units
         units, units_path = _find_int_in_json(
             next_data,
             includes=["unit"],
@@ -481,6 +483,12 @@ def analyser_centris(html: str) -> dict:
             taxes_sco = taxes_vis.get("taxes_scolaires")
             if taxes_sco is not None:
                 taxes_sco_source = "visible"
+
+    # ✅ Units fallback: TITRE d'abord, ensuite visible
+    if units is None:
+        units = _extract_units_from_title(lines)
+        if units is not None:
+            units_source = "title"
 
     if units is None:
         units = _extract_units_from_visible(lines)
@@ -524,5 +532,3 @@ def analyser_centris(html: str) -> dict:
     }
 
     return out
-
-
