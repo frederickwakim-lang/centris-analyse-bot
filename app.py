@@ -11,16 +11,12 @@ load_dotenv()
 app = Flask(__name__)
 app.config["MAX_CONTENT_LENGTH"] = 15 * 1024 * 1024  # 15 MB
 
-# -------- Google Form config (Render env vars) --------
-FORM_POST_URL = os.environ.get("FORM_POST_URL", "")
+# ✅ STRIP pour enlever \n / espaces cachés dans Render
+FORM_POST_URL = (os.environ.get("FORM_POST_URL", "") or "").strip()
 FORM_FIELDS_JSON = os.environ.get("FORM_FIELDS_JSON", "{}")
 
 
 def push_to_google_form(payload: dict) -> dict:
-    """
-    Envoie les champs vers Google Form (formResponse).
-    Inclut fvv/fbzx/pageHistory pour éviter les rejets (404) fréquents.
-    """
     if not FORM_POST_URL:
         return {"ok": False, "error": "FORM_POST_URL missing"}
 
@@ -40,30 +36,30 @@ def push_to_google_form(payload: dict) -> dict:
             cur = cur.get(part)
         return cur
 
-    # Champs entry.*
     form_data = {}
     for entry_id, path in mapping.items():
         val = get_by_path(payload, path)
         form_data[entry_id] = "" if val is None else str(val)
 
     # ✅ Champs cachés Google Forms
-    form_data["fvv"] = os.environ.get("FORM_FVV", "1")
-    fbzx = os.environ.get("FORM_FBZx", "")
+    form_data["fvv"] = (os.environ.get("FORM_FVV", "1") or "1").strip()
+    fbzx = (os.environ.get("FORM_FBZx", "") or "").strip()
     if fbzx:
         form_data["fbzx"] = fbzx
     form_data["pageHistory"] = "0"
 
+    referer = FORM_POST_URL.replace("/formResponse", "/viewform").strip()
+
     headers = {
         "User-Agent": "Mozilla/5.0",
         "Origin": "https://docs.google.com",
-        "Referer": FORM_POST_URL.replace("/formResponse", "/viewform"),
+        "Referer": referer,
     }
 
     try:
-        # ✅ Ne pas suivre les redirects pour voir le vrai code du formResponse
         resp = requests.post(
             FORM_POST_URL,
-            data=form_data,  # x-www-form-urlencoded
+            data=form_data,
             timeout=30,
             headers=headers,
             allow_redirects=False,
@@ -83,7 +79,6 @@ def push_to_google_form(payload: dict) -> dict:
 
 
 def fetch_html_from_url(url: str) -> str:
-    """Télécharge une page (Centris) avec un vrai User-Agent."""
     headers = {
         "User-Agent": (
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -109,7 +104,6 @@ def index():
         urls_text = (request.form.get("urls") or "").strip()
 
         try:
-            # ----- MODE 1 : UNE SEULE ANNONCE -----
             if mode == "single":
                 if not content:
                     error = "Veuillez entrer une URL ou du HTML."
@@ -118,10 +112,8 @@ def index():
                         html = fetch_html_from_url(content)
                     else:
                         html = content
-
                     result = analyser_centris(html)
 
-            # ----- MODE 2 : PLUSIEURS LIENS -----
             elif mode == "batch":
                 urls = [u.strip() for u in urls_text.splitlines() if u.strip()]
                 if not urls:
@@ -151,22 +143,12 @@ def index():
 
 @app.route("/analyze", methods=["POST"])
 def api_analyze():
-    """
-    Endpoint API pour watcher/scripts.
-
-    JSON d'entrée accepté:
-      - {"url": "https://..."}
-      - {"content": "<html>...</html>"}
-      - {"html": "<html>...</html>"}   ✅ compat watcher / tampermonkey
-      - {"push_form": true}           ✅ push Google Form optionnel
-    """
     body = request.get_json(silent=True) or {}
 
     url = body.get("url")
     content = body.get("content")
     html_direct = body.get("html")
 
-    # ✅ priorité au HTML du navigateur (Tampermonkey)
     html = None
     source = None
 
@@ -212,7 +194,6 @@ def api_analyze():
                 "html_len": len(html),
             })
 
-            # ✅ Push Google Form si demandé
             if body.get("push_form") is True:
                 data["_form_push"] = push_to_google_form(data)
 
