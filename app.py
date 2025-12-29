@@ -86,7 +86,7 @@ def api_analyze():
     JSON d'entrée accepté:
       - {"url": "https://..."}
       - {"content": "<html>...</html>"}
-      - {"html": "<html>...</html>"}   ✅ compat watcher
+      - {"html": "<html>...</html>"}   ✅ compat watcher / tampermonkey
     """
     body = request.get_json(silent=True) or {}
 
@@ -94,10 +94,19 @@ def api_analyze():
     content = body.get("content")
     html_direct = body.get("html")
 
+    # ✅ IMPORTANT: priorité au HTML du navigateur (Tampermonkey)
     html = None
     source = None
 
-    if url:
+    if html_direct:
+        source = "html"
+        html = html_direct
+
+    elif content:
+        source = "content"
+        html = content
+
+    elif url:
         source = "url"
         try:
             html = fetch_html_from_url(url)
@@ -109,20 +118,13 @@ def api_analyze():
                 "url": url,
             }), 502
 
-    elif html_direct:
-        source = "html"
-        html = html_direct
-
-    elif content:
-        source = "content"
-        html = content
-
     else:
         return jsonify({
             "error": "missing_input",
             "message": "Il faut fournir 'url' ou 'content' ou 'html'."
         }), 400
 
+    # 🔒 garde-fou: HTML trop court = pas une vraie page Centris
     if not html or len(html) < 2000:
         return jsonify({
             "error": "missing_or_too_short_html",
@@ -133,6 +135,7 @@ def api_analyze():
     try:
         data = analyser_centris(html)
 
+        # 🔒 toujours retourner ces clés
         if isinstance(data, dict):
             data.setdefault("__analyzer_version__", "UNKNOWN")
             data.setdefault("raw_debug", {})
@@ -152,7 +155,7 @@ def api_analyze():
         }), 500
 
 
-# ✅ ALIAS POUR TAMPERMONKEY
+# ✅ ALIAS POUR TAMPERMONKEY (URL propre)
 @app.post("/api/analyze_html")
 def api_analyze_html():
     return api_analyze()
