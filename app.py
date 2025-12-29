@@ -1,4 +1,5 @@
 import os
+import json
 from flask import Flask, render_template, request, jsonify
 from dotenv import load_dotenv
 import requests
@@ -9,6 +10,57 @@ load_dotenv()
 
 app = Flask(__name__)
 app.config["MAX_CONTENT_LENGTH"] = 15 * 1024 * 1024  # 15 MB
+
+
+# -------- Google Form config (Render env vars) --------
+# Exemple:
+# FORM_POST_URL = "https://docs.google.com/forms/d/e/XXXX/formResponse"
+# FORM_FIELDS_JSON = {"entry.123":"property_overview.prix", ...}
+FORM_POST_URL = os.environ.get("FORM_POST_URL", "")
+FORM_FIELDS_JSON = os.environ.get("FORM_FIELDS_JSON", "{}")
+
+
+def push_to_google_form(payload: dict) -> dict:
+    """
+    Envoie les champs vers Google Form (formResponse).
+    Mapping via FORM_FIELDS_JSON: {"entry.123":"property_overview.prix", ...}
+    """
+    if not FORM_POST_URL:
+        return {"ok": False, "error": "FORM_POST_URL missing"}
+
+    try:
+        mapping = json.loads(FORM_FIELDS_JSON or "{}")
+    except Exception as e:
+        return {"ok": False, "error": f"FORM_FIELDS_JSON invalid: {e}"}
+
+    if not isinstance(mapping, dict) or not mapping:
+        return {"ok": False, "error": "FORM_FIELDS_JSON missing/empty"}
+
+    def get_by_path(d, path: str):
+        cur = d
+        for part in path.split("."):
+            if not isinstance(cur, dict):
+                return None
+            cur = cur.get(part)
+        return cur
+
+    form_data = {}
+    for entry_id, path in mapping.items():
+        val = get_by_path(payload, path)
+        form_data[entry_id] = "" if val is None else str(val)
+
+    try:
+        resp = requests.post(
+            FORM_POST_URL,
+            data=form_data,  # x-www-form-urlencoded
+            timeout=30,
+            headers={"User-Agent": "Mozilla/5.0"}
+        )
+        if resp.status_code in (200, 302):
+            return {"ok": True, "status": resp.status_code}
+        return {"ok": False, "status": resp.status_code, "body": resp.text[:200]}
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
 
 
 def fetch_html_from_url(url: str) -> str:
@@ -87,6 +139,7 @@ def api_analyze():
       - {"url": "https://..."}
       - {"content": "<html>...</html>"}
       - {"html": "<html>...</html>"}   ✅ compat watcher / tampermonkey
+      - {"push_form": true}           ✅ push Google Form optionnel
     """
     body = request.get_json(silent=True) or {}
 
@@ -144,6 +197,10 @@ def api_analyze():
                 "source": source,
                 "html_len": len(html),
             })
+
+            # ✅ Push Google Form si demandé
+            if body.get("push_form") is True:
+                data["_form_push"] = push_to_google_form(data)
 
         return jsonify(data), 200
 
