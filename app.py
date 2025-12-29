@@ -11,11 +11,7 @@ load_dotenv()
 app = Flask(__name__)
 app.config["MAX_CONTENT_LENGTH"] = 15 * 1024 * 1024  # 15 MB
 
-
 # -------- Google Form config (Render env vars) --------
-# Exemple:
-# FORM_POST_URL = "https://docs.google.com/forms/d/e/XXXX/formResponse"
-# FORM_FIELDS_JSON = {"entry.123":"property_overview.prix", ...}
 FORM_POST_URL = os.environ.get("FORM_POST_URL", "")
 FORM_FIELDS_JSON = os.environ.get("FORM_FIELDS_JSON", "{}")
 
@@ -23,7 +19,7 @@ FORM_FIELDS_JSON = os.environ.get("FORM_FIELDS_JSON", "{}")
 def push_to_google_form(payload: dict) -> dict:
     """
     Envoie les champs vers Google Form (formResponse).
-    Mapping via FORM_FIELDS_JSON: {"entry.123":"property_overview.prix", ...}
+    Inclut fvv/fbzx/pageHistory pour éviter les rejets (404) fréquents.
     """
     if not FORM_POST_URL:
         return {"ok": False, "error": "FORM_POST_URL missing"}
@@ -44,21 +40,44 @@ def push_to_google_form(payload: dict) -> dict:
             cur = cur.get(part)
         return cur
 
+    # Champs entry.*
     form_data = {}
     for entry_id, path in mapping.items():
         val = get_by_path(payload, path)
         form_data[entry_id] = "" if val is None else str(val)
 
+    # ✅ Champs cachés Google Forms
+    form_data["fvv"] = os.environ.get("FORM_FVV", "1")
+    fbzx = os.environ.get("FORM_FBZx", "")
+    if fbzx:
+        form_data["fbzx"] = fbzx
+    form_data["pageHistory"] = "0"
+
+    headers = {
+        "User-Agent": "Mozilla/5.0",
+        "Origin": "https://docs.google.com",
+        "Referer": FORM_POST_URL.replace("/formResponse", "/viewform"),
+    }
+
     try:
+        # ✅ Ne pas suivre les redirects pour voir le vrai code du formResponse
         resp = requests.post(
             FORM_POST_URL,
             data=form_data,  # x-www-form-urlencoded
             timeout=30,
-            headers={"User-Agent": "Mozilla/5.0"}
+            headers=headers,
+            allow_redirects=False,
         )
-        if resp.status_code in (200, 302):
-            return {"ok": True, "status": resp.status_code}
-        return {"ok": False, "status": resp.status_code, "body": resp.text[:200]}
+
+        ok = resp.status_code in (200, 302, 303)
+        return {
+            "ok": ok,
+            "status": resp.status_code,
+            "location": resp.headers.get("Location"),
+            "used_url": FORM_POST_URL,
+            "sent_fbzx": bool(fbzx),
+            "body": (resp.text or "")[:200],
+        }
     except Exception as e:
         return {"ok": False, "error": str(e)}
 
@@ -147,18 +166,16 @@ def api_analyze():
     content = body.get("content")
     html_direct = body.get("html")
 
-    # ✅ IMPORTANT: priorité au HTML du navigateur (Tampermonkey)
+    # ✅ priorité au HTML du navigateur (Tampermonkey)
     html = None
     source = None
 
     if html_direct:
         source = "html"
         html = html_direct
-
     elif content:
         source = "content"
         html = content
-
     elif url:
         source = "url"
         try:
@@ -170,14 +187,12 @@ def api_analyze():
                 "message": str(e),
                 "url": url,
             }), 502
-
     else:
         return jsonify({
             "error": "missing_input",
             "message": "Il faut fournir 'url' ou 'content' ou 'html'."
         }), 400
 
-    # 🔒 garde-fou: HTML trop court = pas une vraie page Centris
     if not html or len(html) < 2000:
         return jsonify({
             "error": "missing_or_too_short_html",
@@ -188,7 +203,6 @@ def api_analyze():
     try:
         data = analyser_centris(html)
 
-        # 🔒 toujours retourner ces clés
         if isinstance(data, dict):
             data.setdefault("__analyzer_version__", "UNKNOWN")
             data.setdefault("raw_debug", {})
@@ -212,7 +226,6 @@ def api_analyze():
         }), 500
 
 
-# ✅ ALIAS POUR TAMPERMONKEY (URL propre)
 @app.post("/api/analyze_html")
 def api_analyze_html():
     return api_analyze()
