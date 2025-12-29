@@ -6,9 +6,6 @@ from bs4 import BeautifulSoup
 ANALYZER_VERSION = "v8-2025-12-28-nextdata-first"
 
 
-# -----------------------------
-# Money parsing (FR/EN)
-# -----------------------------
 def _money_to_int(x: Any) -> Optional[int]:
     if x is None or isinstance(x, bool):
         return None
@@ -24,7 +21,6 @@ def _money_to_int(x: Any) -> Optional[int]:
 
     s2 = re.sub(r"\s+", "", s2)
 
-    # FR: 3120,00
     if "," in s2 and "." not in s2:
         if re.match(r"^-?\d+,\d{2}$", s2):
             s2 = s2.replace(",", ".")
@@ -34,7 +30,6 @@ def _money_to_int(x: Any) -> Optional[int]:
                 return None
         s2 = s2.replace(",", "")
 
-    # EN: 1,234.56
     if "," in s2 and "." in s2:
         s2 = s2.replace(",", "")
 
@@ -60,9 +55,6 @@ def _as_int(x: Any) -> Optional[int]:
         return None
 
 
-# -----------------------------
-# HTML helpers
-# -----------------------------
 def _clean_text_lines(html: str):
     soup = BeautifulSoup(html or "", "html.parser")
     lines = soup.get_text("\n", strip=True).replace("\u00a0", " ").replace("\u202f", " ").splitlines()
@@ -107,21 +99,7 @@ def _extract_price_jsonld(html: str) -> Optional[int]:
     return None
 
 
-def _first_match_money(text: str, patterns) -> Optional[int]:
-    for pat in patterns:
-        m = re.search(pat, text, flags=re.IGNORECASE)
-        if m:
-            val = _money_to_int(m.group(1))
-            if val is not None:
-                return val
-    return None
-
-
 def _extract_price_from_visible(lines) -> Optional[int]:
-    """
-    Fallback ultime: essaie de retrouver un prix dans le texte visible.
-    (Moins fiable que le JSON, utilisé seulement si JSON absent.)
-    """
     blob_top = "\n".join(lines[:350])
 
     idx = None
@@ -155,53 +133,13 @@ def _extract_price_from_visible(lines) -> Optional[int]:
     return max(candidates)
 
 
-def _extract_revenue_from_visible(lines) -> Optional[int]:
-    text = "\n".join(lines)
-
-    patterns = [
-        r"revenu(?:s)?\s+brut(?:s)?\s+potentiel(?:s)?.*?(\d[\d\s,\.]{1,})\s*\$",
-        r"revenu\s+brut.*?(\d[\d\s,\.]{1,})\s*\$",
-        r"pot\.\s*gross\s*rev\.\s*:\s*\$?\s*(\d[\d\s,\.]{1,})",
-        r"potential\s+gross\s+revenue.*?(\d[\d\s,\.]{1,})\s*\$",
-    ]
-    v = _first_match_money(text, patterns)
-    if v is None:
-        return None
-
-    # Heuristique Centris: parfois "$24" => "$24,000"
-    if 0 < v < 1000:
-        v = v * 1000
-
-    return v
-
-
-def _extract_taxes_from_visible(lines) -> Dict[str, Optional[int]]:
-    text = "\n".join(lines)
-
-    mun_patterns = [
-        r"taxes?\s+municipales?.*?(\d[\d\s,\.]{1,})\s*\$",
-        r"municipal\s+tax(?:es)?.*?(\d[\d\s,\.]{1,})\s*\$",
-    ]
-    sco_patterns = [
-        r"taxes?\s+scolaires?.*?(\d[\d\s,\.]{1,})\s*\$",
-        r"school\s+tax(?:es)?.*?(\d[\d\s,\.]{1,})\s*\$",
-    ]
-
-    taxes_mun = _first_match_money(text, mun_patterns)
-    taxes_sco = _first_match_money(text, sco_patterns)
-
-    return {"taxes_municipales": taxes_mun, "taxes_scolaires": taxes_sco}
-
-
 def _extract_units_from_visible(lines) -> Optional[int]:
     text = "\n".join(lines)
-
     patterns = [
         r"nombre\s+de\s+logements?\s*:?[\s\-]*([0-9]{1,3})",
         r"number\s+of\s+units?\s*:?[\s\-]*([0-9]{1,3})",
         r"residential\s*\((\d{1,3})\)",
     ]
-
     for pat in patterns:
         m = re.search(pat, text, flags=re.IGNORECASE)
         if m:
@@ -211,11 +149,7 @@ def _extract_units_from_visible(lines) -> Optional[int]:
     return None
 
 
-# ✅ NOUVEAU: Units depuis le titre (Triplex/Duplex/Quadruplex)
 def _extract_units_from_title(lines) -> Optional[int]:
-    """
-    Déduit le nombre d'unités à partir du titre (Triplex, Duplex, etc.)
-    """
     for ln in lines[:10]:
         low = ln.lower()
         if "triplex" in low:
@@ -229,20 +163,133 @@ def _extract_units_from_title(lines) -> Optional[int]:
     return None
 
 
-# -----------------------------
-# JSON extraction (Centris / Next.js)
-# -----------------------------
+# ✅ NEW: taxes from table-like lines (label line then value line)
+def _extract_taxes_from_tables(lines) -> Dict[str, Optional[int]]:
+    taxes_mun = None
+    taxes_sco = None
+
+    # we scan around "Taxes" section first if possible
+    start = 0
+    for i, ln in enumerate(lines[:2000]):
+        if ln.strip().lower() == "taxes":
+            start = i
+            break
+
+    scan = lines[start:start + 400] if start else lines[:700]
+
+    for i in range(len(scan) - 1):
+        label = scan[i].lower()
+        val_line = scan[i + 1]
+
+        if taxes_mun is None and ("municipales" in label or "municipal" in label):
+            v = _money_to_int(val_line)
+            if v is None:
+                m = re.search(r"(\d[\d\s,\.]{1,})\s*\$", val_line)
+                v = _money_to_int(m.group(1)) if m else None
+            if v is not None:
+                taxes_mun = v
+
+        if taxes_sco is None and ("scolaires" in label or "school" in label):
+            v = _money_to_int(val_line)
+            if v is None:
+                m = re.search(r"(\d[\d\s,\.]{1,})\s*\$", val_line)
+                v = _money_to_int(m.group(1)) if m else None
+            if v is not None:
+                taxes_sco = v
+
+        if taxes_mun is not None and taxes_sco is not None:
+            break
+
+    return {"taxes_municipales": taxes_mun, "taxes_scolaires": taxes_sco}
+
+
+# ✅ NEW: revenue gross potential from table-like lines
+def _extract_revenue_from_tables(lines) -> Optional[int]:
+    start = 0
+    for i, ln in enumerate(lines[:3000]):
+        if "détails financiers" in ln.lower() or "details financiers" in ln.lower():
+            start = i
+            break
+
+    scan = lines[start:start + 900] if start else lines[:1200]
+
+    for i in range(len(scan) - 1):
+        label = scan[i].lower()
+        if ("revenus bruts potentiels" in label
+            or "revenu brut potentiel" in label
+            or "potential gross revenue" in label
+            or "pot. gross rev" in label):
+            val_line = scan[i + 1]
+            v = _money_to_int(val_line)
+            if v is None:
+                m = re.search(r"(\d[\d\s,\.]{1,})\s*\$", val_line)
+                v = _money_to_int(m.group(1)) if m else None
+            if v is not None and 0 < v < 1000:
+                v *= 1000
+            return v
+    return None
+
+
+def _first_match_money(text: str, patterns) -> Optional[int]:
+    for pat in patterns:
+        m = re.search(pat, text, flags=re.IGNORECASE)
+        if m:
+            val = _money_to_int(m.group(1))
+            if val is not None:
+                return val
+    return None
+
+
+def _extract_revenue_from_visible(lines) -> Optional[int]:
+    # ✅ try table-mode first
+    v_table = _extract_revenue_from_tables(lines)
+    if v_table is not None:
+        return v_table
+
+    text = "\n".join(lines)
+    patterns = [
+        r"revenu(?:s)?\s+brut(?:s)?\s+potentiel(?:s)?.*?(\d[\d\s,\.]{1,})\s*\$",
+        r"revenu\s+brut.*?(\d[\d\s,\.]{1,})\s*\$",
+        r"pot\.\s*gross\s*rev\.\s*:\s*\$?\s*(\d[\d\s,\.]{1,})",
+        r"potential\s+gross\s+revenue.*?(\d[\d\s,\.]{1,})\s*\$",
+    ]
+    v = _first_match_money(text, patterns)
+    if v is None:
+        return None
+    if 0 < v < 1000:
+        v = v * 1000
+    return v
+
+
+def _extract_taxes_from_visible(lines) -> Dict[str, Optional[int]]:
+    # ✅ try table-mode first
+    table = _extract_taxes_from_tables(lines)
+
+    text = "\n".join(lines)
+    mun_patterns = [
+        r"taxes?\s+municipales?.*?(\d[\d\s,\.]{1,})\s*\$",
+        r"municipal\s+tax(?:es)?.*?(\d[\d\s,\.]{1,})\s*\$",
+    ]
+    sco_patterns = [
+        r"taxes?\s+scolaires?.*?(\d[\d\s,\.]{1,})\s*\$",
+        r"school\s+tax(?:es)?.*?(\d[\d\s,\.]{1,})\s*\$",
+    ]
+
+    taxes_mun = table.get("taxes_municipales")
+    taxes_sco = table.get("taxes_scolaires")
+
+    if taxes_mun is None:
+        taxes_mun = _first_match_money(text, mun_patterns)
+    if taxes_sco is None:
+        taxes_sco = _first_match_money(text, sco_patterns)
+
+    return {"taxes_municipales": taxes_mun, "taxes_scolaires": taxes_sco}
+
+
 def _extract_next_data(html: str) -> Tuple[Optional[dict], Optional[str]]:
-    """
-    Cherche __NEXT_DATA__ (Next.js) ou un script JSON similaire.
-    Retourne (json_obj, error_message).
-    """
     if not html:
         return None, "empty_html"
-
     soup = BeautifulSoup(html, "html.parser")
-
-    # 1) Next.js canonical
     s = soup.find("script", id="__NEXT_DATA__")
     if s and s.string:
         raw = s.string.strip()
@@ -250,15 +297,10 @@ def _extract_next_data(html: str) -> Tuple[Optional[dict], Optional[str]]:
             return json.loads(raw), None
         except Exception as e:
             return None, f"next_data_json_error:{e}"
-
     return None, "next_data_not_found"
 
 
 def _iter_json(obj: Any, path: Tuple[Any, ...] = ()) -> Iterable[Tuple[Tuple[Any, ...], Any]]:
-    """
-    Parcours récursif de JSON (dict/list) pour pouvoir chercher des clés n'importe où.
-    Yields: (path, value)
-    """
     yield path, obj
     if isinstance(obj, dict):
         for k, v in obj.items():
@@ -279,12 +321,6 @@ def _key_match(k: str, includes: List[str], excludes: List[str] = None) -> bool:
 
 def _find_money_in_json(next_data: dict, includes: List[str], excludes: List[str] = None,
                         min_v: int = 0, max_v: int = 10**12) -> Tuple[Optional[int], Optional[Tuple[Any, ...]]]:
-    """
-    Cherche une valeur monétaire (int) dans le JSON, en matchant des clés par fragments.
-    """
-    best = None
-    best_path = None
-
     for path, val in _iter_json(next_data):
         if not path:
             continue
@@ -293,25 +329,17 @@ def _find_money_in_json(next_data: dict, includes: List[str], excludes: List[str
             continue
         if not _key_match(key, includes=includes, excludes=excludes or []):
             continue
-
         mv = _money_to_int(val)
         if mv is None:
             continue
         if not (min_v <= mv <= max_v):
             continue
-
-        best = mv
-        best_path = path
-        break
-
-    return best, best_path
+        return mv, path
+    return None, None
 
 
 def _find_int_in_json(next_data: dict, includes: List[str], excludes: List[str] = None,
                       min_v: int = 0, max_v: int = 10**9) -> Tuple[Optional[int], Optional[Tuple[Any, ...]]]:
-    best = None
-    best_path = None
-
     for path, val in _iter_json(next_data):
         if not path:
             continue
@@ -320,31 +348,21 @@ def _find_int_in_json(next_data: dict, includes: List[str], excludes: List[str] 
             continue
         if not _key_match(key, includes=includes, excludes=excludes or []):
             continue
-
         iv = _as_int(val)
         if iv is None:
             continue
         if not (min_v <= iv <= max_v):
             continue
-
-        best = iv
-        best_path = path
-        break
-
-    return best, best_path
+        return iv, path
+    return None, None
 
 
-# -----------------------------
-# Main
-# -----------------------------
 def analyser_centris(html: str) -> dict:
     lines = _clean_text_lines(html)
 
-    # 1) JSON sources
     next_data, next_err = _extract_next_data(html)
     has_next = isinstance(next_data, dict)
 
-    # 2) Prix: JSON-LD -> NextData -> Visible
     price_jsonld = _extract_price_jsonld(html)
 
     price_next = None
@@ -357,22 +375,6 @@ def analyser_centris(html: str) -> dict:
             min_v=20_000,
             max_v=15_000_000
         )
-        if price_next is None:
-            price_next, price_next_path = _find_money_in_json(
-                next_data,
-                includes=["list"],
-                excludes=["tax", "fee"],
-                min_v=20_000,
-                max_v=15_000_000
-            )
-        if price_next is None:
-            price_next, price_next_path = _find_money_in_json(
-                next_data,
-                includes=["ask"],
-                excludes=["tax", "fee"],
-                min_v=20_000,
-                max_v=15_000_000
-            )
 
     price_visible = _extract_price_from_visible(lines)
 
@@ -385,13 +387,12 @@ def analyser_centris(html: str) -> dict:
         (price_next, "next_data", price_next_path),
         (price_visible, "visible", None),
     ):
-        if candidate and 20_000 <= candidate <= 15_000_000 and candidate not in (20_000_000, 26_908_000):
+        if candidate and 20_000 <= candidate <= 15_000_000:
             prix = candidate
             price_source = src
             price_path = pth
             break
 
-    # 3) Revenus/Taxes/Units: NextData d'abord, sinon visible
     revenu = None
     revenu_source = None
     revenu_path = None
@@ -409,65 +410,24 @@ def analyser_centris(html: str) -> dict:
     units_path = None
 
     if has_next:
-        revenu, revenu_path = _find_money_in_json(
-            next_data,
-            includes=["gross", "rev"],
-            excludes=[],
-            min_v=0,
-            max_v=200_000_000
-        )
-        if revenu is None:
-            revenu, revenu_path = _find_money_in_json(
-                next_data,
-                includes=["revenue"],
-                excludes=["tax"],
-                min_v=0,
-                max_v=200_000_000
-            )
+        revenu, revenu_path = _find_money_in_json(next_data, includes=["revenue"], excludes=["tax"], min_v=0, max_v=200_000_000)
         if revenu is not None:
             if 0 < revenu < 1000:
-                revenu = revenu * 1000
+                revenu *= 1000
             revenu_source = "next_data"
 
-        taxes_mun, taxes_mun_path = _find_money_in_json(
-            next_data,
-            includes=["municipal", "tax"],
-            excludes=[],
-            min_v=0,
-            max_v=50_000_000
-        )
+        taxes_mun, taxes_mun_path = _find_money_in_json(next_data, includes=["municipal", "tax"], excludes=[], min_v=0, max_v=50_000_000)
         if taxes_mun is not None:
             taxes_mun_source = "next_data"
 
-        taxes_sco, taxes_sco_path = _find_money_in_json(
-            next_data,
-            includes=["school", "tax"],
-            excludes=[],
-            min_v=0,
-            max_v=50_000_000
-        )
+        taxes_sco, taxes_sco_path = _find_money_in_json(next_data, includes=["school", "tax"], excludes=[], min_v=0, max_v=50_000_000)
         if taxes_sco is not None:
             taxes_sco_source = "next_data"
 
-        units, units_path = _find_int_in_json(
-            next_data,
-            includes=["unit"],
-            excludes=["suite", "community", "maintenance"],
-            min_v=1,
-            max_v=500
-        )
-        if units is None:
-            units, units_path = _find_int_in_json(
-                next_data,
-                includes=["logement"],
-                excludes=[],
-                min_v=1,
-                max_v=500
-            )
+        units, units_path = _find_int_in_json(next_data, includes=["unit"], excludes=["suite", "community", "maintenance"], min_v=1, max_v=500)
         if units is not None:
             units_source = "next_data"
 
-    # Visible fallbacks (si JSON n'a rien)
     if revenu is None:
         revenu = _extract_revenue_from_visible(lines)
         if revenu is not None:
@@ -484,12 +444,10 @@ def analyser_centris(html: str) -> dict:
             if taxes_sco is not None:
                 taxes_sco_source = "visible"
 
-    # ✅ Units fallback: TITRE d'abord, ensuite visible
     if units is None:
         units = _extract_units_from_title(lines)
         if units is not None:
             units_source = "title"
-
     if units is None:
         units = _extract_units_from_visible(lines)
         if units is not None:
@@ -504,9 +462,7 @@ def analyser_centris(html: str) -> dict:
             "quartier": None,
             "type_propriete": None,
         },
-        "revenus": {
-            "revenu_brut_potentiel_annuel": revenu
-        },
+        "revenus": {"revenu_brut_potentiel_annuel": revenu},
         "depenses_vraies": {
             "taxes_municipales": taxes_mun,
             "taxes_scolaires": taxes_sco,
@@ -530,5 +486,4 @@ def analyser_centris(html: str) -> dict:
             "lines_top_sample": lines[:25],
         }
     }
-
     return out
