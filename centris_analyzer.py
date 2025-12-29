@@ -3,7 +3,7 @@ import json
 from typing import Any, Optional, Dict, Tuple, List, Iterable
 from bs4 import BeautifulSoup
 
-ANALYZER_VERSION = "v8-2025-12-28-nextdata-first+annualfix"
+ANALYZER_VERSION = "v8-2025-12-28-nextdata-first+annualfix+priceheader"
 
 
 def _money_to_int(x: Any) -> Optional[int]:
@@ -100,37 +100,34 @@ def _extract_price_jsonld(html: str) -> Optional[int]:
 
 
 def _extract_price_from_visible(lines) -> Optional[int]:
-    blob_top = "\n".join(lines[:350])
-
+    """
+    ✅ Fix: prendre le prix affiché en haut (header) près du titre "à vendre".
+    Avant: prenait un max($) dans une fenêtre large -> pouvait tomber sur évaluation, etc.
+    Maintenant: on prend le 1er montant "$" juste après le titre.
+    """
     idx = None
-    for i, ln in enumerate(lines[:700]):
+    for i, ln in enumerate(lines[:250]):
         low = ln.lower()
         if "à vendre" in low or "for sale" in low:
             idx = i
             break
 
-    candidates = []
+    header = "\n".join(lines[idx: idx + 35]) if idx is not None else "\n".join(lines[:60])
 
-    if idx is not None:
-        window = "\n".join(lines[idx: idx + 120])
-        for m in re.finditer(r'(\d[\d\s,\.]{2,})\s*\$', window):
-            p = _money_to_int(m.group(1))
-            if p:
-                candidates.append(p)
+    m = re.search(r"(\d[\d\s\u00a0\u202f,\.]{2,})\s*\$", header)
+    if m:
+        p = _money_to_int(m.group(1))
+        if p and 20_000 <= p <= 15_000_000:
+            return p
 
-    if not candidates:
-        for m in re.finditer(r'(\d[\d\s,\.]{2,})\s*\$', blob_top):
-            p = _money_to_int(m.group(1))
-            if p:
-                candidates.append(p)
+    # fallback (petite fenêtre plus large)
+    header2 = "\n".join(lines[idx: idx + 80]) if idx is not None else "\n".join(lines[:120])
+    for m2 in re.finditer(r"(\d[\d\s\u00a0\u202f,\.]{2,})\s*\$", header2):
+        p2 = _money_to_int(m2.group(1))
+        if p2 and 20_000 <= p2 <= 15_000_000:
+            return p2
 
-    candidates = [p for p in candidates if p not in (20_000_000, 26_908_000)]
-    candidates = [p for p in candidates if 20_000 <= p <= 15_000_000]
-
-    if not candidates:
-        return None
-
-    return max(candidates)
+    return None
 
 
 def _extract_units_from_visible(lines) -> Optional[int]:
