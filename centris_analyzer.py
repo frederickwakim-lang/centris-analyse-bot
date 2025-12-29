@@ -3,7 +3,7 @@ import json
 from typing import Any, Optional, Dict, Tuple, List, Iterable
 from bs4 import BeautifulSoup
 
-ANALYZER_VERSION = "v8-2025-12-28-nextdata-first"
+ANALYZER_VERSION = "v8-2025-12-28-nextdata-first+annualfix"
 
 
 def _money_to_int(x: Any) -> Optional[int]:
@@ -163,55 +163,49 @@ def _extract_units_from_title(lines) -> Optional[int]:
     return None
 
 
-# ✅ NEW: taxes from table-like lines (label line then value line)
+# ✅ FIX: taxes from table-like lines (Centris often shows monthly + annual)
 def _extract_taxes_from_tables(lines) -> Dict[str, Optional[int]]:
-    taxes_mun = None
-    taxes_sco = None
+    """
+    Centris affiche souvent 2 valeurs: mensuel + annuel.
+    Ex: Municipales: 439 $ puis 5 270 $.
+    ✅ On prend la plus grande valeur (annuelle) pour chaque taxe.
+    """
+    mun_candidates: List[int] = []
+    sco_candidates: List[int] = []
 
-    # we scan around "Taxes" section first if possible
-    start = 0
-    for i, ln in enumerate(lines[:2000]):
-        if ln.strip().lower() == "taxes":
-            start = i
-            break
-
-    scan = lines[start:start + 400] if start else lines[:700]
+    scan = lines[:2000]
 
     for i in range(len(scan) - 1):
         label = scan[i].lower()
         val_line = scan[i + 1]
 
-        if taxes_mun is None and ("municipales" in label or "municipal" in label):
-            v = _money_to_int(val_line)
-            if v is None:
-                m = re.search(r"(\d[\d\s,\.]{1,})\s*\$", val_line)
-                v = _money_to_int(m.group(1)) if m else None
-            if v is not None:
-                taxes_mun = v
+        v = _money_to_int(val_line)
+        if v is None:
+            m = re.search(r"(\d[\d\s,\.]{1,})\s*\$", val_line)
+            v = _money_to_int(m.group(1)) if m else None
 
-        if taxes_sco is None and ("scolaires" in label or "school" in label):
-            v = _money_to_int(val_line)
-            if v is None:
-                m = re.search(r"(\d[\d\s,\.]{1,})\s*\$", val_line)
-                v = _money_to_int(m.group(1)) if m else None
-            if v is not None:
-                taxes_sco = v
+        if v is None:
+            continue
 
-        if taxes_mun is not None and taxes_sco is not None:
-            break
+        if ("municipales" in label) or ("municipal" in label):
+            mun_candidates.append(v)
+
+        if ("scolaires" in label) or ("school" in label):
+            sco_candidates.append(v)
+
+    taxes_mun = max(mun_candidates) if mun_candidates else None
+    taxes_sco = max(sco_candidates) if sco_candidates else None
 
     return {"taxes_municipales": taxes_mun, "taxes_scolaires": taxes_sco}
 
 
-# ✅ NEW: revenue gross potential from table-like lines
+# ✅ FIX: revenue gross potential can be in "Caractéristiques", not only "Détails financiers"
 def _extract_revenue_from_tables(lines) -> Optional[int]:
-    start = 0
-    for i, ln in enumerate(lines[:3000]):
-        if "détails financiers" in ln.lower() or "details financiers" in ln.lower():
-            start = i
-            break
-
-    scan = lines[start:start + 900] if start else lines[:1200]
+    """
+    Revenus bruts potentiels peut être plus bas dans la page (Caractéristiques).
+    ✅ On scanne large (début de page) au lieu de commencer à 'Détails financiers'.
+    """
+    scan = lines[:2000]
 
     for i in range(len(scan) - 1):
         label = scan[i].lower()
@@ -227,6 +221,7 @@ def _extract_revenue_from_tables(lines) -> Optional[int]:
             if v is not None and 0 < v < 1000:
                 v *= 1000
             return v
+
     return None
 
 
