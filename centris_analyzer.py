@@ -3,7 +3,7 @@ import json
 from typing import Any, Optional, Dict, Tuple, List, Iterable
 from bs4 import BeautifulSoup
 
-ANALYZER_VERSION = "v8-2025-12-28-nextdata-first+annualfix+priceheader"
+ANALYZER_VERSION = "v8-2025-12-28-nextdata-first+annualfix+priceheader2"
 
 
 def _money_to_int(x: Any) -> Optional[int]:
@@ -101,33 +101,46 @@ def _extract_price_jsonld(html: str) -> Optional[int]:
 
 def _extract_price_from_visible(lines) -> Optional[int]:
     """
-    ✅ Fix: prendre le prix affiché en haut (header) près du titre "à vendre".
-    Avant: prenait un max($) dans une fenêtre large -> pouvait tomber sur évaluation, etc.
-    Maintenant: on prend le 1er montant "$" juste après le titre.
+    ✅ FIX 2 (robuste):
+    - Centris peut rendre le prix plus loin que le titre.
+    1) Cherche près du titre "à vendre" (fenêtre plus large)
+    2) Fallback: scan début de page, MAIS en filtrant les lignes qui parlent d'évaluation/taxes/dépenses
+       pour éviter de ramasser des montants parasites.
     """
+    # 1) proche du titre
     idx = None
-    for i, ln in enumerate(lines[:250]):
+    for i, ln in enumerate(lines[:400]):
         low = ln.lower()
         if "à vendre" in low or "for sale" in low:
             idx = i
             break
 
-    header = "\n".join(lines[idx: idx + 35]) if idx is not None else "\n".join(lines[:60])
+    if idx is not None:
+        win = "\n".join(lines[idx: idx + 180])
+        m = re.search(r"(\d[\d\s\u00a0\u202f,\.]{2,})\s*\$", win)
+        if m:
+            p = _money_to_int(m.group(1))
+            if p and 20_000 <= p <= 15_000_000:
+                return p
 
-    m = re.search(r"(\d[\d\s\u00a0\u202f,\.]{2,})\s*\$", header)
-    if m:
-        p = _money_to_int(m.group(1))
-        if p and 20_000 <= p <= 15_000_000:
-            return p
+    # 2) fallback filtré (début de page)
+    ignore_markers = ("évaluation", "evaluation", "taxes", "dépenses", "depenses")
+    candidates: List[int] = []
 
-    # fallback (petite fenêtre plus large)
-    header2 = "\n".join(lines[idx: idx + 80]) if idx is not None else "\n".join(lines[:120])
-    for m2 in re.finditer(r"(\d[\d\s\u00a0\u202f,\.]{2,})\s*\$", header2):
-        p2 = _money_to_int(m2.group(1))
-        if p2 and 20_000 <= p2 <= 15_000_000:
-            return p2
+    for ln in lines[:350]:
+        low = ln.lower()
+        if any(k in low for k in ignore_markers):
+            continue
 
-    return None
+        for mm in re.finditer(r"(\d[\d\s\u00a0\u202f,\.]{2,})\s*\$", ln):
+            p2 = _money_to_int(mm.group(1))
+            if p2 and 20_000 <= p2 <= 15_000_000:
+                candidates.append(p2)
+
+    if not candidates:
+        return None
+
+    return max(candidates)
 
 
 def _extract_units_from_visible(lines) -> Optional[int]:
